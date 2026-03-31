@@ -1,0 +1,174 @@
+# ============================================================
+# Research Config — Template
+# ============================================================
+# Copy this file to research_config.yaml (or research_config_<name>.yaml)
+# and fill in your project-specific values.
+#
+# Then run the codegen pipeline to generate all pipeline files:
+#   python -m codegen.generate_extraction_prompt --config research_config.yaml
+#   python -m codegen.generate_schemas --config research_config.yaml
+#   python -m codegen.generate_config --config research_config.yaml
+#   python -m codegen.generate_discovery_config --config research_config.yaml
+#   python -m codegen.generate_gap_prompts --config research_config.yaml
+# ============================================================
+
+project:
+  # Full dissertation/thesis title
+  title: "Your Dissertation Title Here"
+  # Short version for display
+  short_title: "Short Title"
+  # Researcher name
+  researcher_name: "Dr. Your Name"
+
+papers:
+  # Each paper in your dissertation/thesis.
+  # The 'label' appears in dropdown menus and prompts.
+  # The 'focus' describes what this paper examines.
+  - id: paper_1
+    label: "Paper 1: Topic A"
+    focus: "What Paper 1 studies"
+  - id: paper_2
+    label: "Paper 2: Topic B"
+    focus: "What Paper 2 studies"
+  # Add more papers as needed:
+  # - id: paper_3
+  #   label: "Paper 3: Topic C"
+  #   focus: "What Paper 3 studies"
+
+research_context:
+  # High-level summary of your research (used in system prompts)
+  summary: |
+    Describe your research focus in 2-3 sentences. What are your
+    independent variables, dependent variables, and theoretical lens?
+  # Critical disambiguation note (what your DVs are NOT)
+  critical_note: |
+    Clarify any common misinterpretations of your research focus.
+    E.g., "Our DVs are X, NOT Y."
+  # Databases you use for data collection
+  databases:
+    - name: "Database Name 1"
+      purpose: "what you use it for"
+    - name: "Database Name 2"
+      purpose: "what you use it for"
+
+key_scholars:
+  # Scholars whose work you track citations for.
+  # 'key' is used to generate column names like "Cites_Adams", "Adams_Paper_Cited"
+  # 'context' explains why they matter to your research
+  - name: "Scholar Full Name"
+    key: "LastName"
+    context: "why they matter (e.g., methodology, theory)"
+  # - name: "Another Scholar"
+  #   key: "Scholar2"
+  #   context: "their contribution"
+
+theories:
+  # Theoretical frameworks relevant to your research
+  - "Theory 1"
+  - "Theory 2"
+  - "Theory 3"
+  # Add more as needed
+
+custom_sections:
+  # Additional extraction sections beyond the standard 11.
+  # Each section gets its own Google Sheet tab.
+  # 'id' must start with a number (e.g., "12_SECTION_NAME")
+  # 'type' can be "text" (free text) or "enum" (dropdown with options)
+  - id: "12_CUSTOM_SECTION"
+    label: "Custom Section Label"
+    columns:
+      - {name: "Column_1", type: "enum", options: ["Yes", "No"]}
+      - {name: "Column_2", type: "text"}
+      # Add more columns as needed
+
+dropdowns:
+  # Dropdown/enum values for various fields.
+  # These are used in both the extraction prompt and Google Sheet validation.
+
+  DV_Category:
+    # Categories for dependent variables
+    - "Category 1"
+    - "Category 2"
+    - "Other"
+
+  Primary_Theme:
+    # Thematic categories for paper classification
+    - "Theme 1"
+    - "Theme 2"
+    - "Other"
+
+  Paper_Assignment_extras:
+    # Extra options beyond paper labels for Paper_Assignment dropdown
+    - "Multiple"
+    - "Background-Contextual"
+    - "Methodology Reference"
+
+  DV_Relevance_extras:
+    # Extra options beyond "Direct match Paper X" for DV relevance
+    - "Useful proxy"
+    - "Control in our framework"
+    - "Not relevant"
+
+  IV_Type:
+    # Types of independent variables
+    - "Primary IV type"
+    - "Secondary IV type"
+    - "Other"
+
+  IV_Role:
+    # Role of IVs in your framework
+    - "Focal IV"
+    - "Key moderator"
+    - "Control"
+    - "Not in our framework"
+
+relevance_rubric:
+  # Scoring rubric for paper relevance (weights must sum to 1.0)
+  dimensions:
+    - name: "Topic_Alignment"
+      weight: 0.25
+      scale_1: "Not related"
+      scale_3: "Somewhat related"
+      scale_5: "Directly relevant"
+    - name: "Variable_Usefulness"
+      weight: 0.20
+      scale_1: "No overlap"
+      scale_3: "Some overlap"
+      scale_5: "High overlap"
+    - name: "Methodological_Value"
+      weight: 0.20
+      scale_1: "Basic methods"
+      scale_3: "Adequate methods"
+      scale_5: "Advanced methods"
+    - name: "Theoretical_Contribution"
+      weight: 0.15
+      scale_1: "No theory"
+      scale_3: "Some theory"
+      scale_5: "Deep theory"
+    - name: "Recency"
+      weight: 0.10
+      scale_1: "Old"
+      scale_3: "Recent"
+      scale_5: "Very recent"
+    - name: "Publication_Quality"
+      weight: 0.10
+      scale_1: "Low tier"
+      scale_3: "Mid tier"
+      scale_5: "Top tier"
+
+google_sheets:
+  # Google Sheet IDs for data storage
+  # Main extraction spreadsheet
+  spreadsheet_id: ""
+  # Automated discovery spreadsheet (if using discovery pipeline)
+  auto_spreadsheet_id: ""
+
+api:
+  # Email for polite API access (OpenAlex, Unpaywall)
+  mailto: "your.email@example.com"
+
+fallback_keywords:
+  # Default search queries if Claude fails to generate queries
+  # Used by gap_query_builder.py as a last resort
+  - "your research topic keywords"
+  - "alternative search terms"

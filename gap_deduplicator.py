@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+"""
+PhD Literature Extraction Pipeline — Semantic Gap Deduplicator
+================================================================
+Uses Claude Sonnet to detect semantically equivalent research gaps
+that keyword-based overlap misses.
+
+Replaces the simple Jaccard > 0.6 keyword overlap with LLM-based
+semantic comparison. Falls back to keyword overlap if Claude is
+unavailable.
+
+Usage:
+    # Backfill: analyze all existing gaps for duplicates (dry-run)
+    python3 gap_deduplicator.py --backfill
+
+    # Backfill with apply (actually merges duplicates in GAP_TRACKER)
+    python3 gap_deduplicator.py --backfill --apply
+
+    # Show dedup log stats
+    python3 gap_deduplicator.py --stats
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn
+
+from config import CLAUDE_CLI, PIPELINE_DIR
+
+console = Console()
+
+# ─── CONFIGURATION ──────────────────────────────────────────
+
+SONNET_MODEL = "claude-sonnet-4-6"
+DEDUP_TIMEOUT = 120  # seconds for Sonnet dedup call
+DEDUP_LOG_FILE = PIPELINE_DIR / "pipeline_data" / "dedup_log.json"
+KEYWORD_OVERLAP_THRESHOLD = 0.6  # Fallback threshold (original behavior)
+BACKFILL_BATCH_SIZE = 50  # Max gaps per Sonnet clustering call
+
+
+# ─── SYSTEM PROMPTS ─────────────────────────────────────────
+
+DEDUP_CHECK_PROMPT = """You are deduplicating research gaps for a PhD dissertation: "Women on Boards: An International Study in Governance and Wealth Creation."
+
+Your task: For each NEW gap, determine if it is semantically equivalent to any EXISTING gap. Two gaps are duplicates if they ask for essentially the same research contribution, regardless of phrasing.
+
+RULES:
+- "duplicate" = the gaps request the same missing research (same variable + same method + same context = duplicate)
+- Phrasing differences don't matter — "lack of longitudinal studies" ≈ "insufficient time-series data"
+- Similar but DISTINCT gaps are NOT duplicates:
+  - "lack of longitudinal studies" vs "lack of cross-sectional studies" → different methods → NOT duplicate
+  - "no studies in Nordic countries" vs "no studies in MENA region" → different contexts → NOT duplicate
+  - "governance and ESG outcomes" vs "governance and financial performance" → different DVs → NOT duplicate
+- Be CONSERVATIVE: when in doubt, mark as "unique". False negatives are better than false positives.
+- Return ONLY a valid JSON array. No markdown, no code fences."""
+
+BACKFILL_CLUSTER_PROMPT = """You are deduplicating research gaps for a PhD dissertation: "Women on Boards: An International Study in Governance and Wealth Creation."
+
+Your task: Group the gaps below into semantic clusters. Gaps in the same cluster are semantically equivalent — they ask for essentially the same research contribution.
+
+RULES:
+- Each cluster should contain gaps that are TRUE duplicates (would be satisfied by the same study)
+- Gaps that are similar but distinct belong in SEPARATE clusters
+- A gap can only belong to one cluster
+- Singletons (unique gaps) should be in their own cluster of size 1
+- For each cluster with >1 gap, pick the best-phrased gap as the "canonical" one
+- Return ONLY a valid JSON array. No markdown, no code fences.
+
+Return format:
+[
+  {"cluster_id": 1, "canonical_gap_id": "GAP_012", "members": ["GAP_012", "GAP_045"], "reason": "Both request longitudinal analysis of board diversity effects"},
+  {"cluster_id": 2, "canonical_gap_id": "GAP_003", "members": ["GAP_003"], "reason": "Unique gap about CEO duality"},
+  ...
+]"""
+
+
+# ─── GAP DEDUPLICATOR ──────────────────────────────────────
+
+class GapDeduplicator:
+    """
+    Semantic gap deduplication using Claude Sonnet.
+    Falls back to keyword overlap if Claude is unavailable.
+    """
+
+    def __init__(self):
+        self._log = self._load_log()
+
+    # ═══════════════════════════════════════════════════════════
+    # PUBLIC API — Realtime dedup (called during pipeline)
+    # ═══════════════════════════════════════════════════════════
+
+    def check_duplicates(
+        self,
+        new_gaps: list[dict],
+        existing_gaps: list[dict],
+    ) -> dict[str, dict | None]:
+        """
+        Check if new gaps are duplicates of existing gaps.
+
+        Args:
+            new_gaps: List of gap dicts with at least gap_id and gap_statement.
+            existing_gaps: List of existing gap dicts.
+
+        Returns:
+            Dict mapping new gap_id → None (unique) or
+            {"duplicate_of": "GAP_XXX", "reason": "...", "similarity": float}
+        """
+        if not new_gaps or not existing_gaps:
+            return {g.get("gap_id", ""): None for g in new_gaps}
+
+        # Try semantic dedup via Sonnet
+        try:
+            result = self._semantic_check(new_gaps, existing_gaps)
+            if result is not None:
+                self._log_decisions(result, method="sonnet")
+                return result
+        except Exception as e:
+            console.print(f"  [yellow]Semantic dedup failed ({e}), using keyword fallback[/]")
+
+        # Fallback: keyword overlap
+        result = self._keyword_check(new_gaps, existing_gaps)
+        self._log_decisions(result, method="keyword_fallback")
+        return result
+
+    def is_duplicate(self, new_gap: dict, existing_gaps: list[dict]) -> bool:
+        """
+        Simple boolean API: is this single gap a duplicate?
+        Used as drop-in replacement for gap_analyzer._is_duplicate_gap().
+        """
+        if not existing_gaps:
+            return False
+
+        result = self.check_duplicates([new_gap], existing_gaps)
+        gap_id = new_gap.get("gap_id", "")
+        return result.get(gap_id) is not None
+
+    # ═══════════════════════════════════════════════════════════
+    # PUBLIC API — Backfill clustering (standalone)
+    # ═══════════════════════════════════════════════════════════
+
+    def backfill_clusters(self, all_gaps: list[dict]) -> list[dict]:
+        """
+        Cluster all existing gaps by semantic similarity.
+        Returns list of cluster dicts:
+        [{"cluster_id": N, "canonical_gap_id": "GAP_X", "members": [...], "reason": "..."}]
+        """
+        if not all_gaps:
+            return []
+
+        all_clusters = []
+        batches = [
+            all_gaps[i:i + BACKFILL_BATCH_SIZE]
+            for i in range(0, len(all_gaps), BACKFILL_BATCH_SIZE)
+        ]
+
+        cluster_offset = 0
+        for batch_idx, batch in enumerate(batches):
+            if len(batches) > 1:
+                console.print(f"  Clustering batch {batch_idx + 1}/{len(batches)} ({len(batch)} gaps)")
+
+            gap_text = "\n".join(
+                f'{g.get("gap_id", "?")}: "{g.get("gap_statement", "")}"'
+                for g in batch
+            )
+
+            user_prompt = (
+                f"GAPS TO CLUSTER ({len(batch)} total):\n\n"
+                f"{gap_text}\n\n"
+                f"Group these into semantic clusters. Return JSON array."
+            )
+
+            stdout = self._run_claude(
+                prompt=user_prompt,
+                system=BACKFILL_CLUSTER_PROMPT,
+                timeout=DEDUP_TIMEOUT,
+                label=f"Clustering batch {batch_idx + 1}",
+            )
+
+            if stdout:
+                clusters = self._parse_json_output(stdout)
+                if clusters and isinstance(clusters, list):
+                    # Offset cluster IDs to be globally unique
+                    for c in clusters:
+                        if isinstance(c, dict):
+                            c["cluster_id"] = c.get("cluster_id", 0) + cluster_offset
+                    cluster_offset += len(clusters)
+                    all_clusters.extend(clusters)
+
+        return all_clusters
+
+    # ═══════════════════════════════════════════════════════════
+    # INTERNAL — Semantic check via Sonnet
+    # ═══════════════════════════════════════════════════════════
+
+    def _semantic_check(
+        self, new_gaps: list[dict], existing_gaps: list[dict]
+    ) -> dict[str, dict | None] | None:
+        """
+        Use Claude Sonnet to check for semantic duplicates.
+        Returns None if the call fails.
+        """
+        new_text = "\n".join(
+            f'{i + 1}. {g.get("gap_id", "?")}: "{g.get("gap_statement", "")}"'
+            for i, g in enumerate(new_gaps)
+        )
+
+        existing_text = "\n".join(
+            f'- {g.get("gap_id", "?")}: "{g.get("gap_statement", "")[:150]}"'
+            for g in existing_gaps
+        )
+
+        user_prompt = (
+            f"NEW GAPS to check ({len(new_gaps)}):\n{new_text}\n\n"
+            f"EXISTING GAPS ({len(existing_gaps)}):\n{existing_text}\n\n"
+            f"For each new gap, return JSON: "
+            f'[{{"new_gap_id": "...", "status": "duplicate"|"unique", '
+            f'"duplicate_of": "GAP_XXX" (if duplicate), '
+            f'"similarity": 0.0-1.0 (if duplicate), '
+            f'"reason": "..." (if duplicate)}}]'
+        )
+
+        stdout = self._run_claude(
+            prompt=user_prompt,
+            system=DEDUP_CHECK_PROMPT,
+            timeout=DEDUP_TIMEOUT,
+            label="Semantic dedup check",
+        )
+
+        if not stdout:
+            return None
+
+        parsed = self._parse_json_output(stdout)
+        if not parsed or not isinstance(parsed, list):
+            return None
+
+        # Convert to result dict
+        result = {}
+        existing_ids = {g.get("gap_id", "") for g in existing_gaps}
+
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            gid = item.get("new_gap_id", "")
+            if not gid:
+                continue
+
+            status = item.get("status", "unique")
+            if status == "duplicate":
+                dup_of = item.get("duplicate_of", "")
+                # Validate the duplicate_of gap actually exists
+                if dup_of and dup_of in existing_ids:
+                    result[gid] = {
+                        "duplicate_of": dup_of,
+                        "reason": item.get("reason", ""),
+                        "similarity": float(item.get("similarity", 0.9)),
+                    }
+                else:
+                    result[gid] = None  # Invalid reference → treat as unique
+            else:
+                result[gid] = None
+
+        # Fill in any gaps not returned by Sonnet
+        for g in new_gaps:
+            gid = g.get("gap_id", "")
+            if gid not in result:
+                result[gid] = None
+
+        return result
+
+    # ═══════════════════════════════════════════════════════════
+    # INTERNAL — Keyword fallback (original behavior)
+    # ═══════════════════════════════════════════════════════════
+
+    def _keyword_check(
+        self, new_gaps: list[dict], existing_gaps: list[dict]
+    ) -> dict[str, dict | None]:
+        """Keyword Jaccard overlap — the original _is_duplicate_gap logic."""
+        result = {}
+
+        for new_gap in new_gaps:
+            gid = new_gap.get("gap_id", "")
+            new_words = set(new_gap.get("gap_statement", "").lower().split())
+
+            if len(new_words) < 3:
+                result[gid] = None
+                continue
+
+            found_dup = False
+            for existing in existing_gaps:
+                existing_words = set(existing.get("gap_statement", "").lower().split())
+                if len(existing_words) < 3:
+                    continue
+                overlap = len(new_words & existing_words)
+                union = len(new_words | existing_words)
+                if union > 0 and overlap / union > KEYWORD_OVERLAP_THRESHOLD:
+                    result[gid] = {
+                        "duplicate_of": existing.get("gap_id", ""),
+                        "reason": f"Keyword overlap {overlap / union:.0%}",
+                        "similarity": round(overlap / union, 2),
+                    }
+                    found_dup = True
+                    break
+
+            if not found_dup:
+                result[gid] = None
+
+        return result
+
+    # ═══════════════════════════════════════════════════════════
+    # INTERNAL — Claude CLI
+    # ═══════════════════════════════════════════════════════════
+
+    def _run_claude(
+        self, prompt: str, system: str, timeout: int, label: str = "Claude"
+    ) -> str | None:
+        """Spawn Claude Sonnet CLI subprocess. Returns raw stdout or None."""
+        cmd = [
+            CLAUDE_CLI,
+            "-p", prompt,
+            "--output-format", "json",
+            "--model", SONNET_MODEL,
+            "--max-turns", "1",
+            "--no-session-persistence",
+            "--append-system-prompt", system,
+        ]
+
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]{task.description}"),
+                console=console,
+            ) as progress:
+                progress.add_task(label)
+
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env={**os.environ, "CLAUDE_CODE_HEADLESS": "1"},
+                )
+
+                stdout_lines = []
+                stderr_lines = []
+
+                def read_stream(stream, line_list):
+                    for line in stream:
+                        line_list.append(line)
+
+                stdout_thread = threading.Thread(
+                    target=read_stream, args=(process.stdout, stdout_lines), daemon=True
+                )
+                stderr_thread = threading.Thread(
+                    target=read_stream, args=(process.stderr, stderr_lines), daemon=True
+                )
+                stdout_thread.start()
+                stderr_thread.start()
+
+                try:
+                    process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                    console.print(f"  [red]TIMEOUT after {timeout}s[/]")
+                    return None
+
+                stdout_thread.join(timeout=5)
+                stderr_thread.join(timeout=5)
+
+            stdout_full = "".join(stdout_lines)
+
+            if process.returncode != 0:
+                stderr_full = "".join(stderr_lines)
+                console.print(f"  [red]Claude exited with code {process.returncode}[/]")
+                if stderr_full.strip():
+                    console.print(f"  [dim]stderr: {stderr_full[:300]}[/]")
+                return None
+
+            return stdout_full
+
+        except FileNotFoundError:
+            console.print("  [red]'claude' CLI not found[/]")
+            return None
+        except Exception as e:
+            console.print(f"  [red]Unexpected error: {e}[/]")
+            return None
+
+    def _parse_json_output(self, stdout: str) -> list | None:
+        """Parse Claude CLI JSON output (same pattern as gap_matrix_analyzer)."""
+        stdout = stdout.strip()
+        if not stdout:
+            return None
+
+        try:
+            envelope = json.loads(stdout)
+        except json.JSONDecodeError:
+            return self._extract_json_array(stdout)
+
+        if isinstance(envelope, list):
+            return envelope
+
+        if isinstance(envelope, dict) and "result" in envelope:
+            result = envelope["result"]
+            if isinstance(result, list):
+                return result
+            if isinstance(result, str):
+                try:
+                    parsed = json.loads(result)
+                    if isinstance(parsed, list):
+                        return parsed
+                except json.JSONDecodeError:
+                    return self._extract_json_array(result)
+
+        return None
+
+    def _extract_json_array(self, text: str) -> list | None:
+        """Extract outermost [...] from text using bracket-depth matching."""
+        start = text.find("[")
+        if start == -1:
+            return None
+
+        depth = 0
+        in_string = False
+        escape = False
+
+        for i, ch in enumerate(text[start:], start):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        result = json.loads(text[start:i + 1])
+                        if isinstance(result, list):
+                            return result
+                    except json.JSONDecodeError:
+                        return None
+        return None
+
+    # ═══════════════════════════════════════════════════════════
+    # INTERNAL — Audit log
+    # ═══════════════════════════════════════════════════════════
+
+    def _load_log(self) -> list[dict]:
+        """Load dedup log from disk."""
+        if DEDUP_LOG_FILE.exists():
+            try:
+                with open(DEDUP_LOG_FILE) as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                return []
+        return []
+
+    def _save_log(self) -> None:
+        """Save dedup log to disk."""
+        DEDUP_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(DEDUP_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(self._log, f, indent=2, ensure_ascii=False)
+
+    def _log_decisions(self, decisions: dict[str, dict | None], method: str) -> None:
+        """Record dedup decisions to the audit log."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for gap_id, decision in decisions.items():
+            entry = {
+                "timestamp": timestamp,
+                "gap_id": gap_id,
+                "method": method,
+                "is_duplicate": decision is not None,
+            }
+            if decision is not None:
+                entry.update(decision)
+            self._log.append(entry)
+        self._save_log()
+
+    def get_log_stats(self) -> dict:
+        """Return summary stats from the dedup log."""
+        total = len(self._log)
+        duplicates = sum(1 for e in self._log if e.get("is_duplicate"))
+        by_method = {}
+        for e in self._log:
+            m = e.get("method", "unknown")
+            by_method[m] = by_method.get(m, 0) + 1
+        return {
+            "total_checks": total,
+            "duplicates_found": duplicates,
+            "unique": total - duplicates,
+            "by_method": by_method,
+        }
+
+
+# ─── STANDALONE CLI ─────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Gap Deduplicator — semantic gap deduplication")
+    parser.add_argument("--backfill", action="store_true", help="Cluster all existing gaps for duplicates")
+    parser.add_argument("--apply", action="store_true", help="With --backfill: actually merge duplicates in GAP_TRACKER")
+    parser.add_argument("--stats", action="store_true", help="Show dedup log statistics")
+    args = parser.parse_args()
+
+    dedup = GapDeduplicator()
+
+    if args.stats:
+        stats = dedup.get_log_stats()
+        console.print(f"\n  [bold]Gap Deduplicator — Stats[/]")
+        console.print(f"  Total checks: {stats['total_checks']}")
+        console.print(f"  Duplicates found: {stats['duplicates_found']}")
+        console.print(f"  Unique: {stats['unique']}")
+        console.print(f"  By method: {stats['by_method']}")
+        console.print()
+        return
+
+    if args.backfill:
+        console.print("\n  [bold]Gap Deduplicator — Backfill Clustering[/]")
+        console.print("  " + "-" * 50)
+
+        # Load gaps from GAP_TRACKER
+        from populator import SheetPopulator
+        pop = SheetPopulator(on_status=lambda msg: console.print(f"  {msg}"))
+        pop._ensure_connected()
+        ws = pop._get_worksheet("GAP_TRACKER")
+        rows = ws.get_all_records()
+
+        all_gaps = []
+        for row in rows:
+            gap_id = str(row.get("Gap_ID", "")).strip()
+            if not gap_id:
+                continue
+            all_gaps.append({
+                "gap_id": gap_id,
+                "gap_type": str(row.get("Gap_Type", "")),
+                "gap_statement": str(row.get("Gap_Statement", "")),
+            })
+
+        console.print(f"  Loaded {len(all_gaps)} gaps from GAP_TRACKER\n")
+
+        clusters = dedup.backfill_clusters(all_gaps)
+
+        if not clusters:
+            console.print("  [yellow]No clusters returned[/]")
+            return
+
+        # Show results
+        dup_clusters = [c for c in clusters if isinstance(c, dict) and len(c.get("members", [])) > 1]
+        singleton_count = len(clusters) - len(dup_clusters)
+
+        console.print(f"\n  [bold]Results:[/]")
+        console.print(f"  Total clusters: {len(clusters)}")
+        console.print(f"  Duplicate clusters (>1 member): {len(dup_clusters)}")
+        console.print(f"  Unique (singletons): {singleton_count}")
+        console.print()
+
+        total_redundant = 0
+        for c in dup_clusters:
+            members = c.get("members", [])
+            canonical = c.get("canonical_gap_id", members[0] if members else "?")
+            reason = c.get("reason", "")
+            redundant = len(members) - 1
+            total_redundant += redundant
+
+            console.print(
+                f"  [cyan]Cluster {c.get('cluster_id', '?')}[/]: "
+                f"{len(members)} gaps → keep [bold]{canonical}[/], "
+                f"merge {redundant} duplicate(s)"
+            )
+            for m in members:
+                marker = " ★" if m == canonical else ""
+                # Find statement
+                stmt = next(
+                    (g["gap_statement"][:80] for g in all_gaps if g["gap_id"] == m),
+                    "?"
+                )
+                console.print(f"    {m}{marker}: {stmt}")
+            if reason:
+                console.print(f"    [dim]Reason: {reason}[/]")
+            console.print()
+
+        console.print(f"  [bold]Total redundant gaps: {total_redundant}[/]")
+
+        if args.apply and dup_clusters:
+            console.print("\n  [bold yellow]Applying merges to GAP_TRACKER...[/]")
+            _apply_merges(pop, dup_clusters, all_gaps)
+        elif dup_clusters:
+            console.print("  [dim]Dry run — use --apply to merge duplicates[/]")
+
+        console.print()
+        return
+
+    parser.print_help()
+
+
+def _apply_merges(pop, dup_clusters: list[dict], all_gaps: list[dict]) -> None:
+    """Apply cluster merges to GAP_TRACKER in Google Sheets."""
+    from gspread import Cell
+
+    ws = pop._get_worksheet("GAP_TRACKER")
+    header_map = pop._get_header_map("GAP_TRACKER")
+    all_values = ws.get_all_values()
+
+    if len(all_values) < 2:
+        console.print("  [red]GAP_TRACKER is empty[/]")
+        return
+
+    gid_col = header_map.get("Gap_ID", 0)
+    status_col = header_map.get("Status", 0)
+    notes_col = header_map.get("Coverage_Notes", 0)
+
+    # Build gap_id → row index map
+    gid_to_row = {}
+    for row_idx, row in enumerate(all_values[1:], start=2):
+        if len(row) > gid_col and row[gid_col].strip():
+            gid_to_row[row[gid_col].strip()] = row_idx
+
+    cells_to_update = []
+    merged_count = 0
+
+    for cluster in dup_clusters:
+        members = cluster.get("members", [])
+        canonical = cluster.get("canonical_gap_id", "")
+        reason = cluster.get("reason", "")
+
+        if len(members) < 2 or not canonical:
+            continue
+
+        for member in members:
+            if member == canonical:
+                continue
+
+            row_idx = gid_to_row.get(member)
+            if not row_idx:
+                continue
+
+            # Mark as merged → set Status to "Merged" and add note
+            if status_col:
+                cells_to_update.append(
+                    Cell(row=row_idx, col=status_col + 1, value="Merged")
+                )
+            if notes_col:
+                note = f"Merged into {canonical}: {reason}"
+                cells_to_update.append(
+                    Cell(row=row_idx, col=notes_col + 1, value=note[:500])
+                )
+            merged_count += 1
+
+    if cells_to_update:
+        ws.update_cells(cells_to_update)
+        console.print(f"  [green]Merged {merged_count} duplicate gaps in GAP_TRACKER[/]")
+    else:
+        console.print("  [dim]No merges to apply[/]")
+
+
+if __name__ == "__main__":
+    main()

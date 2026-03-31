@@ -1,0 +1,126 @@
+@import "tailwindcss";
+
+@theme {
+  /* Claude-inspired warm earthy palette */
+  --color-bg-primary: #FAF6F1;
+  --color-bg-surface: #FFFFFF;
+  --color-bg-elevated: #F3EDE5;
+  --color-bg-hover: #EBE3D8;
+  --color-border: rgba(140, 120, 95, 0.15);
+  --color-border-bright: rgba(140, 120, 95, 0.28);
+
+  /* Warm terracotta / sienna accent */
+  --color-accent-teal: #C4704B;
+  --color-accent-teal-light: #A85835;
+
+  /* Deep gold / amber accent */
+  --color-accent-gold: #9A7B4F;
+  --color-accent-gold-light: #B8944F;
+
+  /* Text — warm dark tones */
+  --color-text-primary: #2D2117;
+  --color-text-secondary: #5C4B3A;
+  --color-text-muted: #8C7A68;
+
+  /* Status colors — softer, earthy */
+  --color-success: #5B8C5A;
+  --color-warning: #C4944B;
+  --color-error: #BF5540;
+
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+@layer base {
+  body {
+    @apply bg-bg-primary text-text-primary font-sans antialiased;
+    min-height: 100vh;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--color-bg-primary);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-bg-hover);
+    border-radius: 3px;
+  }
+}
+
+@layer components {
+  .glass-card {
+    background: rgba(255, 255, 255, 0.75);
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    box-shadow: 0 1px 3px rgba(45, 33, 23, 0.04), 0 1px 2px rgba(45, 33, 23, 0.03);
+  }
+
+  .glass-card:hover {
+    border-color: var(--color-border-bright);
+  }
+
+  .stat-value {
+    @apply text-3xl font-bold tracking-tight;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Tooltip for action cards */
+  .tooltip-wrapper {
+    position: relative;
+  }
+
+  .tooltip-wrapper .tooltip-content {
+    visibility: hidden;
+    opacity: 0;
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #2D2117;
+    color: #FAF6F1;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 12px;
+    line-height: 1.5;
+    width: 280px;
+    z-index: 50;
+    pointer-events: none;
+    transition: opacity 0.2s, visibility 0.2s;
+    box-shadow: 0 4px 12px rgba(45, 33, 23, 0.15);
+  }
+
+  .tooltip-wrapper .tooltip-content::after {
+    content: '';
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 6px solid transparent;
+    border-top-color: #2D2117;
+  }
+
+  .tooltip-wrapper:hover .tooltip-content {
+    visibility: visible;
+    opacity: 1;
+  }
+
+  /* Toast slide-up animation */
+  .animate-slide-up {
+    animation: slide-up 0.3s ease-out;
+  }
+
+  @keyframes slide-up {
+    from {
+      opacity: 0;
+      transform: translateY(12px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+}

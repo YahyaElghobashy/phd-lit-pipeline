@@ -1,0 +1,682 @@
+"""
+PhD Literature Discovery Pipeline — Gap Novelty Analyzer
+==========================================================
+For each extracted paper, evaluates it against ALL original research gaps.
+Uses Claude Opus 4.6 with thinking for deep, evidence-based assessment.
+Writes results to GAP_NOVELTY tab in the Automated Extraction sheet.
+
+Key difference from gap_coverage_analyzer.py:
+- That module evaluates gaps from the *paper's perspective* (does this paper cover gap X?)
+- THIS module evaluates from the *gap's perspective* (is gap X still valid given this paper?)
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.text import Text
+from rich import box
+
+from populator import authenticate, retry_on_api_error
+from discovery_config import (
+    AUTO_SPREADSHEET_ID,
+    CLAUDE_OPUS_MODEL,
+    GAP_NOVELTY_COLUMNS,
+    DISCOVERIES_DIR,
+)
+from discovery_extractor import AutoSheetPopulator
+from gap_query_builder import GapReader
+from config import CLAUDE_CLI, GAP_BATCH_SIZE, SHEETS_WRITE_DELAY
+
+console = Console()
+
+
+# ─── SYSTEM PROMPT ──────────────────────────────────────────
+
+NOVELTY_SYSTEM_PROMPT = """You are a research gap novelty assessor for a PhD dissertation: "Women on Boards: An International Study in Governance and Wealth Creation."
+
+Your task: Given a newly discovered paper's full extraction data, evaluate whether each research gap is STILL VALID or has been addressed by this paper's findings.
+
+This is a GAP VALIDITY assessment, not a paper review. For each gap, determine:
+
+1. Affects_Gap — Does this paper have any bearing on this gap?
+   - "Yes" — paper directly investigates the gap's core question
+   - "Tangentially" — paper touches related topics but doesn't directly address the gap
+   - "No" — paper is irrelevant to this gap
+
+2. Impact_Level — How much does this paper diminish the gap?
+   - "NOT ADDRESSED" — paper has no evidence relevant to this gap
+   - "PARTIALLY ADDRESSED" — paper provides some relevant evidence but gap remains mostly open
+   - "SUBSTANTIALLY COVERED" — paper directly investigates the core of this gap with evidence
+   - "DIRECTLY TACKLED" — paper fully resolves this gap with comprehensive, robust evidence
+
+3. Evidence_Summary — What specific findings from THIS paper are relevant? Cite variables, coefficients, sample details. NOT general knowledge.
+
+4. Gap_Still_Valid — After considering this paper's evidence:
+   - "Yes" — gap remains open and valid for the PhD
+   - "Partially" — some aspects addressed but substantial parts remain
+   - "No" — this paper has closed this gap
+
+5. Validation_Reasoning — WHY is the gap still valid (or not)? Reference specific methodological, contextual, or variable differences.
+
+6. What_Remains_Open — What aspects of this gap does this paper NOT resolve?
+
+7. Implications_For_PhD — What does this paper's evidence mean for the PhD's approach to this gap?
+
+CRITICAL RULES:
+- Be CONSERVATIVE. Most discovered papers will be "NOT ADDRESSED" for most gaps.
+- "PARTIALLY ADDRESSED" requires DIRECTLY relevant findings with specific evidence.
+- "SUBSTANTIALLY COVERED" requires the paper tested the EXACT relationship the gap describes.
+- "DIRECTLY TACKLED" requires comprehensive resolution with robust methodology.
+- For "NOT ADDRESSED" gaps: Affects_Gap="No", Evidence_Summary="None.", Gap_Still_Valid="Yes", What_Remains_Open="All aspects remain open.", Implications_For_PhD="".
+- NEVER fabricate evidence. Only cite findings that exist in the extraction data provided.
+- Return ONLY a valid JSON array. No markdown, no code fences, no explanation.
+
+Format:
+[
+  {
+    "gap_id": "GAP_XXX",
+    "affects_gap": "Yes/No/Tangentially",
+    "impact_level": "NOT ADDRESSED/PARTIALLY ADDRESSED/SUBSTANTIALLY COVERED/DIRECTLY TACKLED",
+    "evidence_summary": "...",
+    "gap_still_valid": "Yes/No/Partially",
+    "validation_reasoning": "...",
+    "what_remains_open": "...",
+    "implications_for_phd": "..."
+  }
+]"""
+
+
+# ─── GAP NOVELTY ANALYZER ────────────────────────────────────
+
+class GapNoveltyAnalyzer:
+    """
+    Evaluates discovered papers against all original research gaps.
+    Writes novelty assessments to GAP_NOVELTY tab in the auto sheet.
+    """
+
+    TIMEOUT = 300          # 5 min per batch (Opus with thinking)
+    MAX_RETRIES = 2
+    RETRY_DELAY = 30
+    BATCH_SIZE = GAP_BATCH_SIZE  # 75 gaps per call
+
+    def __init__(self, auto_sheet_id: str = ""):
+        self._auto_sheet_id = auto_sheet_id or AUTO_SPREADSHEET_ID
+        self._gap_reader = GapReader()
+        self._populator = AutoSheetPopulator(
+            sheet_id=self._auto_sheet_id,
+            on_status=lambda msg: console.print(f"  [dim]{msg}[/dim]"),
+        )
+        self._gaps: list[dict] | None = None
+
+    def _get_gaps(self) -> list[dict]:
+        """Get all unresolved gaps (cached)."""
+        if self._gaps is None:
+            self._gaps = self._gap_reader.get_unresolved_gaps()
+        return self._gaps
+
+    def _get_existing_novelty(self) -> set[tuple[str, str]]:
+        """Read existing (PAPER_ID, Gap_ID) pairs from GAP_NOVELTY tab."""
+        try:
+            self._populator._ensure_connected()
+            ws = self._populator._get_worksheet("GAP_NOVELTY")
+            all_values = ws.get_all_values()
+            pairs = set()
+            for row in all_values[1:]:  # skip header
+                if len(row) >= 2:
+                    pid = row[0].strip()
+                    gid = row[1].strip()
+                    if pid and gid:
+                        pairs.add((pid, gid))
+            return pairs
+        except Exception as e:
+            console.print(f"  [yellow]Could not read existing novelty data: {e}[/]")
+            return set()
+
+    # ─── Paper Context Builder ────────────────────────────────
+
+    def _build_paper_context(self, extraction: dict) -> str:
+        """Compose paper's key sections into prompt text for novelty assessment."""
+        parts = [f"PAPER: {extraction.get('paper_id', 'unknown')}"]
+
+        # Identification
+        ident = extraction.get("1_IDENTIFICATION", {})
+        if ident:
+            parts.append(f"\nTITLE/CITATION: {ident.get('Full_Citation_APA7', '')}")
+
+        # Abstract
+        abstract = extraction.get("Verbatim_Abstract", "")
+        if abstract:
+            parts.append(f"\nABSTRACT:\n{abstract}")
+
+        # Research Design
+        rd = extraction.get("2_RESEARCH_DESIGN", {})
+        if rd:
+            rq = rd.get("Research_Question", "")
+            if rq:
+                parts.append(f"\nRESEARCH QUESTION: {rq}")
+            summary = rd.get("One_Sentence_Summary", "")
+            if summary:
+                parts.append(f"SUMMARY: {summary}")
+
+        # Findings
+        f = extraction.get("7_FINDINGS", {})
+        if f:
+            parts.append("\nFINDINGS:")
+            for key in ["Main_Finding", "Effect_Direction", "Coefficient_Beta",
+                         "P_Value", "Economic_Significance", "Moderating_Effects_Found",
+                         "Mediating_Effects_Found", "Mechanisms_Channels_Identified"]:
+                val = f.get(key, "")
+                if val:
+                    parts.append(f"  {key}: {val}")
+
+        # Variables
+        v = extraction.get("3_VARIABLES", {})
+        if v:
+            parts.append("\nVARIABLES:")
+            for prefix in ["DV1", "DV2", "IV1", "IV2", "IV3"]:
+                name = v.get(f"{prefix}_Name", "")
+                if name:
+                    meas = v.get(f"{prefix}_Measurement", "")
+                    parts.append(f"  {prefix}: {name}" + (f" — {meas}" if meas else ""))
+            for i in [1, 2]:
+                name = v.get(f"Moderator{i}_Name", "")
+                if name:
+                    parts.append(f"  Moderator{i}: {name}")
+                name = v.get(f"Mediator{i}_Name", "")
+                if name:
+                    parts.append(f"  Mediator{i}: {name}")
+
+        # Methodology
+        m = extraction.get("4_METHODOLOGY", {})
+        if m:
+            parts.append("\nMETHODOLOGY:")
+            for key in ["Research_Design", "Estimation_Primary", "Endogeneity_Methods"]:
+                val = m.get(key, "")
+                if val:
+                    parts.append(f"  {key}: {val}")
+
+        # Sample
+        s = extraction.get("5_SAMPLE", {})
+        if s:
+            parts.append("\nSAMPLE:")
+            for key in ["Countries", "N_Observations", "Period_Start", "Period_End", "Industries_Included"]:
+                val = s.get(key, "")
+                if val:
+                    parts.append(f"  {key}: {val}")
+
+        # Theory
+        t = extraction.get("6_THEORY", {})
+        if t:
+            theory = t.get("Primary_Theory", "")
+            if theory:
+                parts.append(f"\nTHEORY: {theory}")
+
+        # Gaps & Limitations from the paper itself
+        gl = extraction.get("8_GAPS_LIMITATIONS", {})
+        if gl:
+            gap_lines = []
+            for key in ["OUR_Theoretical_Gap", "OUR_Methodological_Gap", "OUR_Variable_Gap",
+                         "OUR_Contextual_Gap", "OUR_Mechanism_Gap"]:
+                val = gl.get(key, "")
+                if val:
+                    gap_lines.append(f"  {key}: {val}")
+            if gap_lines:
+                parts.append("\nPAPER'S GAP ASSESSMENT:")
+                parts.extend(gap_lines)
+
+        # Narrative assessment
+        narr = extraction.get("narrative_assessment", "")
+        if narr:
+            parts.append(f"\nNARRATIVE ASSESSMENT: {narr}")
+
+        return "\n".join(parts)
+
+    def _build_gap_list(self, gaps: list[dict]) -> str:
+        """Format gaps for the prompt."""
+        lines = ["RESEARCH GAPS TO EVALUATE:", ""]
+        for g in gaps:
+            lines.append(f'{g["gap_id"]} [{g["gap_type"]}]:')
+            lines.append(f'"{g["gap_statement"]}"')
+            if g.get("variables_needed"):
+                lines.append(f'  Variables needed: {g["variables_needed"]}')
+            if g.get("methodology_needed"):
+                lines.append(f'  Methodology needed: {g["methodology_needed"]}')
+            lines.append("")
+        return "\n".join(lines)
+
+    # ─── Claude CLI ───────────────────────────────────────────
+
+    def _run_novelty_analysis(
+        self, paper_id: str, paper_context: str, gap_list_text: str
+    ) -> list[dict] | None:
+        """Spawn Claude Opus 4.6 CLI for novelty assessment."""
+        user_prompt = (
+            f"Evaluate this newly discovered paper against the following research gaps.\n\n"
+            f"{paper_context}\n\n---\n\n{gap_list_text}\n---\n\n"
+            f"Return a JSON array with one object per gap. "
+            f"Fields: gap_id, affects_gap, impact_level, evidence_summary, "
+            f"gap_still_valid, validation_reasoning, what_remains_open, implications_for_phd"
+        )
+
+        cmd = [
+            CLAUDE_CLI,
+            "-p", user_prompt,
+            "--output-format", "json",
+            "--model", CLAUDE_OPUS_MODEL,
+            "--max-turns", "1",
+            "--no-session-persistence",
+            "--append-system-prompt", NOVELTY_SYSTEM_PROMPT,
+        ]
+
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]{task.description}"),
+                console=console,
+            ) as progress:
+                progress.add_task(f"Novelty analysis: {paper_id}...")
+
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env={**os.environ, "CLAUDE_CODE_HEADLESS": "1"},
+                )
+
+                stdout_lines = []
+                stderr_lines = []
+
+                def read_stream(stream, line_list):
+                    for line in stream:
+                        line_list.append(line)
+
+                stdout_thread = threading.Thread(
+                    target=read_stream, args=(process.stdout, stdout_lines), daemon=True
+                )
+                stderr_thread = threading.Thread(
+                    target=read_stream, args=(process.stderr, stderr_lines), daemon=True
+                )
+                stdout_thread.start()
+                stderr_thread.start()
+
+                try:
+                    process.wait(timeout=self.TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                    console.print(f"  [red]TIMEOUT after {self.TIMEOUT}s[/red]")
+                    return None
+
+                stdout_thread.join(timeout=5)
+                stderr_thread.join(timeout=5)
+
+            stdout_full = "".join(stdout_lines)
+            stderr_full = "".join(stderr_lines)
+
+            if process.returncode != 0:
+                console.print(f"  [red]Claude exited with code {process.returncode}[/red]")
+                if stderr_full.strip():
+                    console.print(f"  [dim]stderr: {stderr_full[:300]}[/dim]")
+                return None
+
+            return self._parse_output(stdout_full)
+
+        except FileNotFoundError:
+            console.print("  [red]'claude' CLI not found. Is Claude Code installed?[/red]")
+            return None
+        except Exception as e:
+            console.print(f"  [red]Unexpected error: {e}[/red]")
+            return None
+
+    def _parse_output(self, stdout: str) -> list[dict] | None:
+        """Parse Claude CLI JSON output expecting a JSON array."""
+        stdout = stdout.strip()
+        if not stdout:
+            console.print("  [red]Empty output from Claude CLI[/red]")
+            return None
+
+        try:
+            envelope = json.loads(stdout)
+        except json.JSONDecodeError:
+            return self._extract_json_array(stdout)
+
+        if isinstance(envelope, list):
+            return envelope
+
+        if isinstance(envelope, dict) and "result" in envelope:
+            result = envelope["result"]
+            if isinstance(result, list):
+                return result
+            if isinstance(result, str):
+                try:
+                    parsed = json.loads(result)
+                    if isinstance(parsed, list):
+                        return parsed
+                except json.JSONDecodeError:
+                    return self._extract_json_array(result)
+
+        console.print("  [red]Could not find novelty array in Claude output[/red]")
+        return None
+
+    def _extract_json_array(self, text: str) -> list[dict] | None:
+        """Extract outermost [...] from text using bracket-depth matching."""
+        start = text.find("[")
+        if start == -1:
+            return None
+
+        depth = 0
+        in_string = False
+        escape = False
+
+        for i, ch in enumerate(text[start:], start):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        result = json.loads(text[start:i + 1])
+                        if isinstance(result, list):
+                            return result
+                    except json.JSONDecodeError:
+                        console.print("  [red]Found JSON-like array but couldn't parse[/red]")
+                        return None
+        return None
+
+    # ─── Public API ───────────────────────────────────────────
+
+    def analyze_paper(self, paper_id: str, extraction: dict) -> dict:
+        """
+        Evaluate one paper against all unresolved gaps.
+        Returns stats: {"written": N, "skipped": N, "failed": N, "assessments": [...]}
+        """
+        gaps = self._get_gaps()
+        if not gaps:
+            console.print("  [yellow]No unresolved gaps found[/]")
+            return {"written": 0, "skipped": 0, "failed": 0, "assessments": []}
+
+        # Check which gaps already have novelty assessment for this paper
+        existing = self._get_existing_novelty()
+        missing_gaps = [g for g in gaps if (paper_id, g["gap_id"]) not in existing]
+
+        if not missing_gaps:
+            console.print(f"  [dim]All {len(gaps)} gaps already assessed for {paper_id}[/]")
+            return {"written": 0, "skipped": len(gaps), "failed": 0, "assessments": []}
+
+        console.print(f"  Assessing {len(missing_gaps)} gaps ({len(gaps) - len(missing_gaps)} already done)")
+
+        paper_context = self._build_paper_context(extraction)
+
+        # Batch gaps
+        batches = [missing_gaps[i:i + self.BATCH_SIZE] for i in range(0, len(missing_gaps), self.BATCH_SIZE)]
+        all_assessments = []
+
+        for batch_idx, batch in enumerate(batches):
+            if len(batches) > 1:
+                console.print(f"  Batch {batch_idx + 1}/{len(batches)} ({len(batch)} gaps)")
+
+            gap_list_text = self._build_gap_list(batch)
+
+            assessments = None
+            for attempt in range(self.MAX_RETRIES + 1):
+                if attempt > 0:
+                    console.print(f"  [yellow]Retry {attempt}/{self.MAX_RETRIES} in {self.RETRY_DELAY}s...[/]")
+                    time.sleep(self.RETRY_DELAY)
+
+                assessments = self._run_novelty_analysis(paper_id, paper_context, gap_list_text)
+                if assessments is not None:
+                    break
+
+            if assessments is None:
+                console.print(f"  [red]All retries exhausted for {paper_id} batch {batch_idx + 1}[/]")
+            else:
+                all_assessments.extend(assessments)
+
+        if not all_assessments:
+            return {"written": 0, "skipped": 0, "failed": len(missing_gaps), "assessments": []}
+
+        # Write to GAP_NOVELTY tab
+        result = self._write_novelty_rows(paper_id, all_assessments, missing_gaps, existing)
+        result["assessments"] = all_assessments
+        return result
+
+    @retry_on_api_error()
+    def _write_novelty_rows(
+        self,
+        paper_id: str,
+        assessments: list[dict],
+        missing_gaps: list[dict],
+        existing: set[tuple[str, str]],
+    ) -> dict:
+        """Write novelty assessment rows to GAP_NOVELTY tab."""
+        stats = {"written": 0, "skipped": 0, "failed": 0}
+
+        # Index assessments by gap_id
+        assessment_map = {}
+        for a in assessments:
+            gid = a.get("gap_id", "")
+            if gid and gid not in assessment_map:
+                assessment_map[gid] = a
+
+        # Build gap statement lookup
+        gap_statements = {g["gap_id"]: g["gap_statement"] for g in missing_gaps}
+
+        assessed_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        for gap in missing_gaps:
+            gid = gap["gap_id"]
+
+            # Skip if already exists
+            if (paper_id, gid) in existing:
+                stats["skipped"] += 1
+                continue
+
+            a = assessment_map.get(gid)
+            if not a:
+                stats["failed"] += 1
+                continue
+
+            row_data = {
+                "PAPER_ID": paper_id,
+                "Gap_ID": gid,
+                "Gap_Statement": gap_statements.get(gid, "")[:500],
+                "Affects_Gap": a.get("affects_gap", "No"),
+                "Impact_Level": a.get("impact_level", "NOT ADDRESSED"),
+                "Evidence_Summary": a.get("evidence_summary", "")[:500],
+                "Gap_Still_Valid": a.get("gap_still_valid", "Yes"),
+                "Validation_Reasoning": a.get("validation_reasoning", "")[:500],
+                "What_Remains_Open": a.get("what_remains_open", "")[:500],
+                "Implications_For_PhD": a.get("implications_for_phd", "")[:300],
+                "Assessed_By": "Claude Opus 4.6 (Auto-Discovery)",
+                "Assessed_At": assessed_at,
+            }
+
+            try:
+                self._populator._write_row_by_headers("GAP_NOVELTY", row_data)
+                stats["written"] += 1
+            except Exception as e:
+                console.print(f"  [red]Failed to write {gid}: {e}[/]")
+                stats["failed"] += 1
+
+            time.sleep(SHEETS_WRITE_DELAY)
+
+        console.print(f"  GAP_NOVELTY: {stats['written']} written, {stats['skipped']} skipped, {stats['failed']} failed")
+        return stats
+
+    def analyze_all_discoveries(self) -> dict:
+        """
+        Analyze all extraction JSONs in discoveries/ against all gaps.
+        Skips papers that already have full novelty coverage.
+        """
+        totals = {"written": 0, "skipped": 0, "failed": 0, "papers_processed": 0, "assessments": []}
+
+        discovery_files = sorted(DISCOVERIES_DIR.glob("*.json"))
+        # Filter out metadata-only files
+        extraction_files = [f for f in discovery_files if "_metadata" not in f.name]
+
+        if not extraction_files:
+            console.print("[yellow]No extraction files found in discoveries/[/]")
+            return totals
+
+        gaps = self._get_gaps()
+        if not gaps:
+            console.print("[yellow]No unresolved gaps found[/]")
+            return totals
+
+        existing = self._get_existing_novelty()
+        gap_ids = {g["gap_id"] for g in gaps}
+
+        # Find papers with missing novelty assessments
+        papers_to_analyze = []
+        for ext_file in extraction_files:
+            try:
+                with open(ext_file) as f:
+                    extraction = json.load(f)
+                pid = extraction.get("paper_id", "")
+                if not pid:
+                    continue
+                missing = [gid for gid in gap_ids if (pid, gid) not in existing]
+                if missing:
+                    papers_to_analyze.append((pid, extraction, len(missing)))
+            except Exception as e:
+                console.print(f"  [red]Error reading {ext_file.name}: {e}[/]")
+
+        if not papers_to_analyze:
+            console.print("[green]All discovery papers fully assessed against all gaps[/]")
+            return totals
+
+        console.print(
+            f"\n  [bold]Papers to analyze: {len(papers_to_analyze)}[/] "
+            f"× {len(gaps)} gaps\n"
+        )
+
+        for i, (pid, extraction, n_missing) in enumerate(papers_to_analyze, 1):
+            console.print(f"\n  [{i}/{len(papers_to_analyze)}] [bold cyan]{pid}[/] — {n_missing} gaps")
+            result = self.analyze_paper(pid, extraction)
+            totals["written"] += result["written"]
+            totals["skipped"] += result["skipped"]
+            totals["failed"] += result["failed"]
+            totals["papers_processed"] += 1
+            totals["assessments"].extend(result.get("assessments", []))
+
+        return totals
+
+
+# ─── DISPLAY ─────────────────────────────────────────────────
+
+def show_novelty_summary(assessments: list[dict], paper_id: str = ""):
+    """Display novelty assessment summary."""
+    if not assessments:
+        console.print("[yellow]No assessments to display[/]")
+        return
+
+    # Count by impact level
+    impact_counts = {}
+    validity_counts = {}
+    for a in assessments:
+        level = a.get("impact_level", "NOT ADDRESSED")
+        impact_counts[level] = impact_counts.get(level, 0) + 1
+        valid = a.get("gap_still_valid", "Yes")
+        validity_counts[valid] = validity_counts.get(valid, 0) + 1
+
+    title = f"Gap Novelty Assessment — {paper_id}" if paper_id else "Gap Novelty Assessment"
+
+    content = Text()
+    content.append(f"{title}\n\n", style="bold magenta")
+    content.append("Impact Level:\n")
+    for level in ["NOT ADDRESSED", "PARTIALLY ADDRESSED", "SUBSTANTIALLY COVERED", "DIRECTLY TACKLED"]:
+        count = impact_counts.get(level, 0)
+        if count > 0:
+            style = "dim" if level == "NOT ADDRESSED" else "yellow" if "PARTIAL" in level else "green"
+            content.append(f"  {level}: {count}\n", style=style)
+
+    content.append("\nGap Validity:\n")
+    for v in ["Yes", "Partially", "No"]:
+        count = validity_counts.get(v, 0)
+        if count > 0:
+            style = "green" if v == "Yes" else "yellow" if v == "Partially" else "red"
+            content.append(f"  Still Valid = {v}: {count}\n", style=style)
+
+    # Show non-trivial assessments
+    relevant = [a for a in assessments if a.get("impact_level", "NOT ADDRESSED") != "NOT ADDRESSED"]
+    if relevant:
+        content.append(f"\nRelevant Assessments ({len(relevant)}):\n")
+        for a in relevant[:10]:
+            gid = a.get("gap_id", "?")
+            level = a.get("impact_level", "?")
+            valid = a.get("gap_still_valid", "?")
+            summary = a.get("evidence_summary", "")[:80]
+            content.append(f"  {gid}: {level} | Still valid: {valid}\n", style="cyan")
+            if summary:
+                content.append(f"    {summary}...\n", style="dim")
+
+    console.print(Panel(content, border_style="magenta", box=box.ROUNDED))
+
+
+# ─── STANDALONE ENTRY ─────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Gap Novelty Analyzer — assess discovered papers against gaps")
+    parser.add_argument("--paper", type=str, help="Analyze a specific paper (substring match in discoveries/)")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be analyzed")
+    args = parser.parse_args()
+
+    analyzer = GapNoveltyAnalyzer()
+
+    if args.dry_run:
+        gaps = analyzer._get_gaps()
+        discovery_files = sorted(DISCOVERIES_DIR.glob("*.json"))
+        extraction_files = [f for f in discovery_files if "_metadata" not in f.name]
+        console.print(f"[bold]Gaps: {len(gaps)}[/]")
+        console.print(f"[bold]Discovery extractions: {len(extraction_files)}[/]")
+        for f in extraction_files:
+            console.print(f"  📄 {f.name}")
+        console.print(f"\n[dim]Would generate up to {len(gaps) * len(extraction_files)} novelty assessments[/]")
+
+    elif args.paper:
+        # Find matching extraction
+        matched = None
+        for f in DISCOVERIES_DIR.glob("*.json"):
+            if "_metadata" in f.name:
+                continue
+            if args.paper.lower() in f.name.lower():
+                with open(f) as fh:
+                    matched = json.load(fh)
+                break
+
+        if matched:
+            pid = matched.get("paper_id", "unknown")
+            console.print(f"[bold]Analyzing {pid} against all gaps...[/]\n")
+            result = analyzer.analyze_paper(pid, matched)
+            show_novelty_summary(result.get("assessments", []), pid)
+        else:
+            console.print(f"[red]No extraction found matching '{args.paper}' in discoveries/[/]")
+    else:
+        console.print("[bold]Analyzing all discoveries against all gaps...[/]\n")
+        totals = analyzer.analyze_all_discoveries()
+        console.print(f"\n[bold green]Done: {totals['written']} novelty rows written, "
+                       f"{totals['papers_processed']} papers processed[/]")

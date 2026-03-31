@@ -1,0 +1,136 @@
+project:
+  title: "Women on Boards: An International Study in Governance and Wealth Creation"
+  short_title: "Women on Boards"
+  researcher_name: "Dr. Yara Aboubakr"
+
+papers:
+  - id: paper_1
+    label: "Paper 1: Technology"
+    focus: "Technology & Digital Transformation outcomes"
+  - id: paper_2
+    label: "Paper 2: Sustainability"
+    focus: "Environmental Sustainability / ESG outcomes"
+  - id: paper_3
+    label: "Paper 3: Innovation"
+    focus: "Innovation as a mediating pathway"
+
+research_context:
+  summary: |
+    The research examines how board gender diversity and director characteristics
+    (education, experience, busyness, tenure, executive status, time-to-retirement, etc.)
+    affect NON-MONETARY wealth creation.
+  critical_note: |
+    WEALTH ≠ MONEY. The dependent variables are sustainability scores, innovation metrics,
+    green patents, R&D efficiency, digital transformation indices — NOT ROA, Tobin's Q,
+    or stock returns. Financial measures are controls only.
+  databases:
+    - name: "BoardEx"
+      purpose: "board composition"
+    - name: "Thomson Reuters/Refinitiv"
+      purpose: "financials, ESG, patents"
+
+key_scholars:
+  - name: "Renée Adams"
+    key: "Adams"
+    context: "methodology"
+  - name: "Alice Eagly"
+    key: "Eagly"
+    context: "social role theory"
+
+theories:
+  - "Agency"
+  - "Resource Dependence"
+  - "Upper Echelons"
+  - "Social Role (Eagly)"
+  - "Stakeholder"
+  - "Critical Mass (Kanter)"
+  - "Human Capital"
+  - "Institutional"
+
+custom_sections:
+  - id: "12_BOARD_CHARS"
+    label: "Board Characteristics"
+    columns:
+      - {name: "Gender_Diversity_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Board_Size_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Board_Independence_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "CEO_Chair_Duality_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Director_Age_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Director_Tenure_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Education_Level_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Education_Field_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Busyness_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Exec_vs_NonExec_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Nationality_Intl_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Functional_Background_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Years_Experience_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Time_To_Retirement_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Network_Centrality_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Committee_Membership_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Meeting_Frequency_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Board_Compensation_Examined", type: "enum", options: ["Yes", "No"]}
+      - {name: "Director_vs_Board_Level", type: "enum", options: ["Director-level", "Board-level", "Both", "Not clear"]}
+      - {name: "Gender_X_Char_Interactions", type: "text"}
+      - {name: "Critical_Mass_Tested", type: "enum", options: ["Yes", "No"]}
+      - {name: "Critical_Mass_Result", type: "text"}
+      - {name: "Missing_Chars_From_Our_Framework", type: "text"}
+
+dropdowns:
+  DV_Category:
+    - "Financial Performance"
+    - "ESG-Sustainability"
+    - "Innovation-Patents"
+    - "Digital-Technology"
+    - "Risk"
+    - "Other"
+  Primary_Theme:
+    - "BGD→Firm Performance"
+    - "BGD→Digital Transformation"
+    - "BGD→Environmental Innovation"
+    - "BGD→Sustainability-ESG"
+    - "Board Chars→Innovation"
+    - "Board Chars→Performance"
+    - "DT→Corporate Governance"
+    - "Methodology-Causal ID"
+    - "Theoretical Framework"
+    - "Other"
+  Paper_Assignment_extras:
+    - "Multiple"
+    - "Background-Contextual"
+    - "Methodology Reference"
+  DV_Relevance_extras:
+    - "Useful proxy"
+    - "Control in our framework"
+    - "Not relevant"
+  IV_Type:
+    - "Gender diversity measure"
+    - "Board characteristic"
+    - "Firm characteristic"
+    - "Other"
+  IV_Role:
+    - "Focal IV"
+    - "Key moderator"
+    - "Board control"
+    - "Firm control"
+    - "Not in our framework"
+
+relevance_rubric:
+  dimensions:
+    - {name: "Topic_Alignment", weight: 0.25, scale_1: "Tangential", scale_3: "Shares some variables", scale_5: "Directly studies our IV+DV domains"}
+    - {name: "Variable_Usefulness", weight: 0.20, scale_1: "No overlap", scale_3: "Some shared controls", scale_5: "Uses our focal IVs/DVs"}
+    - {name: "Methodological_Value", weight: 0.20, scale_1: "Basic OLS, no endogeneity", scale_3: "Panel FE, some robustness", scale_5: "Causal design, comprehensive robustness"}
+    - {name: "Theoretical_Contribution", weight: 0.15, scale_1: "No theory", scale_3: "1-2 theories adequate", scale_5: "Deep multi-theory integration"}
+    - {name: "Recency", weight: 0.10, scale_1: "Pre-2015", scale_3: "2018-2022", scale_5: "2023-2026"}
+    - {name: "Publication_Quality", weight: 0.10, scale_1: "Unknown journal", scale_3: "ABS 2-3", scale_5: "FT50/UTD24/ABS 4*"}
+
+google_sheets:
+  spreadsheet_id: "15OI-dwZBCpag7K_Gif1GcAampoou9pqFHVohjcHKpIc"
+  auto_spreadsheet_id: "1lmt-sNf15Gllvf6OEQrne7bpt0Wj0GsPigNssJplH2Y"
+
+api:
+  mailto: "yahya.elghobashy@gmail.com"
+
+fallback_keywords:
+  - "women board directors firm performance governance"
+  - "board gender diversity corporate outcomes"
+  - "female directors board composition"

@@ -1,0 +1,109 @@
+"""
+Codegen — Generate gap prompt updates
+=======================================
+Uses regex to update dissertation title/context in:
+  - gap_matrix_analyzer.py (SCREEN_SYSTEM_PROMPT, DEEP_SYSTEM_PROMPT)
+  - gap_query_builder.py (QUERY_BUILDER_SYSTEM_PROMPT)
+"""
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+from codegen.config_loader import ResearchConfig, load_config
+
+
+# The known title to find and replace
+_OLD_TITLE = "Women on Boards: An International Study in Governance and Wealth Creation"
+
+
+def generate(config: ResearchConfig, pipeline_dir: str = ".") -> None:
+    """
+    Update gap prompt files with the new dissertation title and context.
+
+    Targets:
+      - gap_matrix_analyzer.py: SCREEN_SYSTEM_PROMPT and DEEP_SYSTEM_PROMPT
+      - gap_query_builder.py: QUERY_BUILDER_SYSTEM_PROMPT
+    """
+    base = Path(pipeline_dir)
+    new_title = config.project.title
+
+    # Build new context line for gap_query_builder
+    paper_descriptions = []
+    for p in config.papers:
+        paper_descriptions.append(p.focus.lower())
+    papers_text = ", ".join(paper_descriptions[:-1])
+    if len(paper_descriptions) > 1:
+        papers_text += f", and {paper_descriptions[-1]}"
+    elif paper_descriptions:
+        papers_text = paper_descriptions[0]
+
+    n_papers = len(config.papers)
+    n_word = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five"}.get(n_papers, str(n_papers))
+
+    # ─── gap_matrix_analyzer.py ──────────────────────────────
+
+    gma_path = base / "gap_matrix_analyzer.py"
+    if gma_path.exists():
+        content = gma_path.read_text(encoding="utf-8")
+
+        # Replace title in SCREEN_SYSTEM_PROMPT
+        content = re.sub(
+            r'(SCREEN_SYSTEM_PROMPT\s*=\s*"""[^"]*?PhD dissertation:\s*")' + re.escape(_OLD_TITLE) + r'(")',
+            lambda m: m.group(1) + new_title + m.group(2),
+            content,
+        )
+        # Simpler: just replace all occurrences of the old title
+        content = content.replace(_OLD_TITLE, new_title)
+
+        gma_path.write_text(content, encoding="utf-8")
+        print(f"Updated {gma_path.resolve()}")
+    else:
+        print(f"Skipped {gma_path} (not found)")
+
+    # ─── gap_query_builder.py ────────────────────────────────
+
+    gqb_path = base / "gap_query_builder.py"
+    if gqb_path.exists():
+        content = gqb_path.read_text(encoding="utf-8")
+
+        # Replace the old title everywhere it appears
+        content = content.replace(_OLD_TITLE, new_title)
+
+        # Replace the full PhD context line
+        old_context_pattern = re.compile(
+            r'(PhD context:\s*")' + re.escape(_OLD_TITLE)
+            + r'"\s*\u2014\s*a\s+[^.]+\.',
+        )
+        new_context = (
+            f'PhD context: "{new_title}" \u2014 a {n_word}-paper dissertation '
+            f"studying {papers_text}."
+        )
+        # Use a broader replacement if the regex doesn't match (title already changed)
+        if old_context_pattern.search(content):
+            content = old_context_pattern.sub(new_context, content)
+        else:
+            # Fallback: replace any PhD context line
+            content = re.sub(
+                r'PhD context:.*?\.',
+                new_context,
+                content,
+                count=1,
+            )
+
+        gqb_path.write_text(content, encoding="utf-8")
+        print(f"Updated {gqb_path.resolve()}")
+    else:
+        print(f"Skipped {gqb_path} (not found)")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Update gap prompts from research config")
+    parser.add_argument("--config", default="research_config.yaml", help="Path to research_config.yaml")
+    parser.add_argument("--pipeline-dir", default=".", help="Path to pipeline directory")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    generate(cfg, args.pipeline_dir)

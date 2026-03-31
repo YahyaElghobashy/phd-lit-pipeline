@@ -1,0 +1,6 @@
+gspread>=5.12
+google-auth>=2.23
+google-auth-oauthlib>=1.1
+rich>=13.7
+pydantic>=2.5
+pyyaml>=6.0

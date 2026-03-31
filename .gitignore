@@ -1,0 +1,15 @@
+token.json
+client_secret.json
+pipeline_state.json
+discovery_state.json
+research_config.yaml
+__pycache__/
+*.pyc
+extractions/
+discoveries/
+reports/
+pipeline_data/
+node_modules/
+dist/
+.pytest_cache/
+.env
