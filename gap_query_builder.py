@@ -37,7 +37,7 @@ console = Console()
 
 QUERY_BUILDER_SYSTEM_PROMPT = """You are a research query specialist helping a PhD student discover papers relevant to specific research gaps.
 
-PhD context: "Women on Boards: An International Study in Governance and Wealth Creation" — a three-paper dissertation studying technology & digital transformation outcomes, environmental sustainability / esg outcomes, and innovation as a mediating pathway.
+PhD context: "[TITLE_PLACEHOLDER]" — configured via research_config.yaml
 
 Your task: Convert a research gap statement into optimal academic search queries for OpenAlex (a scholarly search engine).
 
@@ -48,7 +48,7 @@ RULES:
 4. First query: most direct/literal translation of the gap
 5. Second query: broader conceptual framing or alternative terminology
 6. Third query: methodological or contextual angle (if applicable)
-7. Avoid overly generic queries like "corporate governance" alone
+7. Avoid overly generic queries like "your primary research domain" alone
 8. Include relevant variable names, methodological terms, or geographic contexts from the gap
 9. Do NOT include quotes or boolean operators — OpenAlex uses semantic search
 
@@ -387,14 +387,14 @@ class GapQueryBuilder:
             "contextual": "cross-country institutional context",
             "mechanism": "mechanism channel pathway",
         }
-        extra = type_terms.get(gap_type, "board gender diversity")
+        extra = type_terms.get(gap_type, "research topic")
         if len(key_words) >= 3:
             queries.append({"query": f"{' '.join(key_words[:3])} {extra}", "angle": "broader"})
         else:
             queries.append({"query": f"{statement[:40]} {extra}", "angle": "broader"})
 
         # Generic governance query
-        queries.append({"query": "women board directors firm performance governance", "angle": "methodological"})
+        queries.append({"query": "research topic fallback query", "angle": "methodological"})
 
         return {
             "gap_id": gap["gap_id"],

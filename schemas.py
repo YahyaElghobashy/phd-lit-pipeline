@@ -126,11 +126,18 @@ COLUMNS = {
         "Potential_Hypothesis", "Variables_Needed", "Methodology_Needed",
         "Data_Available", "Status", "Notes", "Coverage_Level",
         "Covering_Paper_IDs", "Coverage_Notes",
+        # Taxonomy columns (Phase 2 overhaul)
+        "Tier", "Tier_Justification", "Tier_Set_By", "Tier_Set_At",
     ],
     "GAP_EVIDENCE": [
         "Gap_ID", "Paper_ID", "Pct_Eliminated", "Pct_Remaining_Before",
         "Pct_Remaining_After", "Aspect_Addressed", "What_Still_Remains",
+        "Reasoning",  # Full AI reasoning text (Phase 4 overhaul)
         "Assessed_By", "Assessed_At", "Source",
+        # Confidence scoring (Module 6)
+        "Confidence_Methodological", "Confidence_Sample",
+        "Confidence_Variables", "Confidence_Directness",
+        "Confidence_Overall", "Confidence_Tier",
     ],
 }
 

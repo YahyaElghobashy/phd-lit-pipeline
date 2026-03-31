@@ -21,7 +21,7 @@ const navItems = [
 export default function Sidebar() {
   const { data: status } = useActionStatus()
   const isRunning = status?.is_running ?? false
-  const [researcherName, setResearcherName] = useState('Dr. Yara Aboubakr')
+  const [researcherName, setResearcherName] = useState('Researcher')
 
   useEffect(() => {
     api.getAdminConfig()

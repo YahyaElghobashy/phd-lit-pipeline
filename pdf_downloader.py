@@ -101,12 +101,20 @@ class PDFDownloader:
             "User-Agent": f"PhDDiscoveryPipeline/1.0 (mailto:{API_MAILTO})",
         })
 
-    def download_paper(self, paper: dict) -> Optional[Path]:
+    def download_paper(self, paper: dict, use_scihub: bool = True) -> Optional[Path]:
         """
-        Download a paper's PDF if available.
+        Download a paper's PDF using a cascading source chain.
+
+        Chain order:
+        1. Existing oa_url (from OpenAlex/S2 search results)
+        2. Unpaywall (DOI lookup)
+        3. Semantic Scholar openAccessPdf (DOI lookup)
+        4. CORE API downloadUrl/sourceFulltextUrls (DOI lookup)
+        5. Sci-Hub (DOI lookup, last resort — disable with use_scihub=False)
 
         Args:
             paper: Normalized paper dict with 'oa_url', 'DOI', 'is_oa' fields
+            use_scihub: Whether to try Sci-Hub as last resort (default True)
 
         Returns:
             Path to downloaded PDF, or None if not available/failed
@@ -114,42 +122,102 @@ class PDFDownloader:
         doi = paper.get("DOI", "")
         title = paper.get("title", "")[:60]
 
-        # Step 1: Get PDF URL
+        # Step 1: Get PDF URL from existing metadata
         pdf_url = paper.get("oa_url", "")
+        source = "metadata"
 
-        # Step 2: If no URL yet, try Unpaywall
+        # Step 2: Try Unpaywall
         if not pdf_url and doi:
-            try:
-                pdf_url = self._unpaywall.get_oa_url(doi)
-                if pdf_url:
-                    paper["oa_url"] = pdf_url
-                    paper["is_oa"] = "Yes"
-            except Exception:
-                pass
+            pdf_url = self._try_unpaywall(doi)
+            if pdf_url:
+                source = "unpaywall"
+
+        # Step 3: Try Semantic Scholar
+        if not pdf_url and doi:
+            pdf_url = self._try_semantic_scholar(doi)
+            if pdf_url:
+                source = "semantic_scholar"
+
+        # Step 4: Try CORE API
+        if not pdf_url and doi:
+            pdf_url = self._try_core(doi)
+            if pdf_url:
+                source = "core"
+
+        # Step 5: Try Sci-Hub (last resort)
+        if not pdf_url and doi and use_scihub:
+            pdf_url = self._try_scihub(doi)
+            if pdf_url:
+                source = "scihub"
 
         if not pdf_url:
-            console.print(f"    [dim]No OA PDF URL for: {title}...[/]")
+            console.print(f"    [dim]No PDF found across all sources: {title}...[/]")
             return None
 
-        # Step 3: Generate filename and check if already downloaded
+        # Track which source provided the URL
+        paper["_pdf_source"] = source
+        paper["oa_url"] = pdf_url
+        paper["is_oa"] = "Yes"
+
+        # Generate filename and check if already downloaded
         filename = _generate_filename(paper)
         dest_path = self.download_dir / filename
 
-        # Handle collision
         if dest_path.exists():
             console.print(f"    [dim]Already downloaded: {filename}[/]")
             return dest_path
 
-        # Step 4: Download
-        console.print(f"    [blue]Downloading: {filename}[/]")
+        # Download
+        console.print(f"    [blue]Downloading ({source}): {filename}[/]")
         try:
             return self._download_file(pdf_url, dest_path)
         except Exception as e:
-            console.print(f"    [red]Download failed: {e}[/]")
-            # Clean up partial download
+            console.print(f"    [red]Download failed ({source}): {e}[/]")
             if dest_path.exists():
                 dest_path.unlink()
             return None
+
+    def _try_unpaywall(self, doi: str) -> Optional[str]:
+        """Try Unpaywall for OA PDF URL."""
+        try:
+            return self._unpaywall.get_oa_url(doi)
+        except Exception:
+            return None
+
+    def _try_semantic_scholar(self, doi: str) -> Optional[str]:
+        """Try Semantic Scholar for OA PDF URL."""
+        try:
+            from api_clients import SemanticScholarClient
+            s2 = SemanticScholarClient()
+            paper = s2.get_by_doi(doi)
+            if paper and paper.get("oa_url"):
+                return paper["oa_url"]
+        except Exception:
+            pass
+        return None
+
+    def _try_core(self, doi: str) -> Optional[str]:
+        """Try CORE API for PDF URLs."""
+        try:
+            from api_clients import COREClient
+            core = COREClient()
+            urls = core.get_pdf_urls(doi)
+            for url in urls:
+                if url:
+                    return url
+        except Exception:
+            pass
+        return None
+
+    def _try_scihub(self, doi: str) -> Optional[str]:
+        """Try Sci-Hub for PDF URL (last resort)."""
+        try:
+            from api_clients import SciHubClient
+            sh = SciHubClient()
+            return sh.get_pdf_url(doi)
+        except Exception:
+            pass
+        return None
 
     @retry_on_api_error(max_retries=2, base_delay=3.0)
     def _download_file(self, url: str, dest_path: Path) -> Optional[Path]:
@@ -243,6 +311,7 @@ class PDFDownloader:
         self,
         papers: list[dict],
         on_progress: callable = None,
+        use_scihub: bool = True,
     ) -> dict:
         """
         Download PDFs for a batch of papers.
@@ -263,7 +332,7 @@ class PDFDownloader:
             if on_progress:
                 on_progress(i, len(papers), paper)
 
-            pdf_path = self.download_paper(paper)
+            pdf_path = self.download_paper(paper, use_scihub=use_scihub)
 
             if pdf_path:
                 results["downloaded"].append((paper, pdf_path))

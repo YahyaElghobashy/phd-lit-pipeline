@@ -1,11 +1,13 @@
 """
 PhD Literature Discovery Pipeline — Academic API Clients
 ==========================================================
-OpenAlex (primary search), CrossRef (enrichment), Unpaywall (OA PDF URLs).
-All clients return normalized dicts. Rate limiting built in.
+OpenAlex (primary search), Semantic Scholar, CORE, CrossRef (enrichment),
+Unpaywall (OA PDF URLs), Sci-Hub (last-resort PDF). All clients return
+normalized dicts. Rate limiting built in.
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 from datetime import datetime
@@ -213,7 +215,7 @@ def _normalize_paper(raw: dict) -> dict:
         "is_oa": is_oa,
         "oa_url": oa_url,
         "openalex_id": raw.get("id", ""),
-        "relevance_score": raw.get("relevance_score"),
+        "openalex_relevance_score": raw.get("relevance_score"),
     }
 
 
@@ -243,6 +245,7 @@ class OpenAlexClient:
         year_to: int | None = None,
         min_citations: int = 0,
         paper_type: str = "article",
+        concept_ids: list[str] | None = None,
     ) -> list[dict]:
         """
         Search OpenAlex for works matching query.
@@ -254,6 +257,9 @@ class OpenAlexClient:
             year_to: Filter by publication year <= this
             min_citations: Minimum citation count
             paper_type: OpenAlex type filter (default: article)
+            concept_ids: Optional list of OpenAlex concept IDs to filter by (OR logic).
+                         e.g. ["C39389867", "C2778397978"] for your research domain concepts.
+                         Dramatically improves relevance for domain-specific queries.
 
         Returns:
             List of normalized paper dicts
@@ -271,6 +277,9 @@ class OpenAlexClient:
             filters.append(f"publication_year:<{year_to + 1}")
         if min_citations > 0:
             filters.append(f"cited_by_count:>{min_citations - 1}")
+        if concept_ids:
+            # OR logic: concepts.id:C123|C456 matches papers tagged with either concept
+            filters.append(f"concepts.id:{'|'.join(concept_ids)}")
 
         params = {
             "per_page": min(max_results, 200),
@@ -464,5 +473,437 @@ class UnpaywallClient:
             pdf_url = loc.get("url_for_pdf")
             if pdf_url:
                 return pdf_url
+
+        return None
+
+
+# ─── SEMANTIC SCHOLAR CLIENT ───────────────────────────────
+
+class SemanticScholarClient:
+    """Search and retrieve papers from Semantic Scholar API."""
+
+    # Fields to request from the API
+    _FIELDS = "paperId,title,abstract,year,authors,citationCount,openAccessPdf,externalIds,publicationTypes,journal"
+
+    def __init__(self, api_key: str | None = None):
+        from discovery_config import (
+            SEMANTIC_SCHOLAR_BASE_URL,
+            SEMANTIC_SCHOLAR_RATE_LIMIT,
+            SEMANTIC_SCHOLAR_RATE_LIMIT_WITH_KEY,
+        )
+        self.base_url = SEMANTIC_SCHOLAR_BASE_URL
+        self.api_key = api_key or os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")
+        self._rate_limit_delay = (
+            SEMANTIC_SCHOLAR_RATE_LIMIT_WITH_KEY if self.api_key
+            else SEMANTIC_SCHOLAR_RATE_LIMIT
+        )
+        self._last_request_time = 0.0
+
+    def _rate_limit(self):
+        elapsed = time.time() - self._last_request_time
+        if elapsed < self._rate_limit_delay:
+            time.sleep(self._rate_limit_delay - elapsed)
+        self._last_request_time = time.time()
+
+    def _headers(self) -> dict:
+        h = {}
+        if self.api_key:
+            h["x-api-key"] = self.api_key
+        return h
+
+    def _normalize_s2_paper(self, raw: dict) -> dict:
+        """Convert a Semantic Scholar paper record to our normalized dict."""
+        ext_ids = raw.get("externalIds") or {}
+        doi = _normalize_doi(ext_ids.get("DOI", ""))
+
+        authors_list = raw.get("authors") or []
+        authors = "; ".join(a.get("name", "") for a in authors_list if a.get("name"))
+
+        title = raw.get("title", "") or ""
+        year = raw.get("year")
+        cited_by = raw.get("citationCount", 0) or 0
+
+        oa_pdf = raw.get("openAccessPdf") or {}
+        oa_url = oa_pdf.get("url", "")
+        is_oa = "Yes" if oa_url else "No"
+
+        abstract = raw.get("abstract", "") or ""
+
+        journal_info = raw.get("journal") or {}
+        journal = journal_info.get("name", "")
+
+        pub_types = raw.get("publicationTypes") or []
+        paper_type = "Journal Article"
+        if "Review" in pub_types:
+            paper_type = "Review"
+        elif "Conference" in pub_types:
+            paper_type = "Conference Paper"
+        elif "Book" in pub_types:
+            paper_type = "Book Chapter"
+
+        # Build paper_id: FirstAuthor_Year_Keyword
+        first_author = "Unknown"
+        if authors_list:
+            name = authors_list[0].get("name", "")
+            parts = name.split()
+            first_author = parts[-1] if parts else "Unknown"
+
+        keyword = ""
+        if title:
+            skip_words = {"the", "a", "an", "of", "in", "for", "to", "and", "or", "is", "are", "on", "how", "does", "do"}
+            words = re.sub(r'[^\w\s]', '', title).split()
+            for w in words:
+                if w.lower() not in skip_words and len(w) > 2:
+                    keyword = w
+                    break
+            if not keyword and words:
+                keyword = words[0]
+
+        paper_id = f"{first_author}_{year}_{keyword}" if first_author and year else f"Unknown_{title[:20]}"
+
+        return {
+            "paper_id": paper_id,
+            "title": title,
+            "DOI": doi,
+            "Full_Citation_APA7": self._build_citation(authors_list, year, title, journal, doi),
+            "Authors": authors,
+            "Year": str(year) if year else "",
+            "Journal": journal,
+            "Journal_Tier": "",
+            "Paper_Type": paper_type,
+            "Citation_Count": str(cited_by),
+            "Search_Query_Source": "",
+            "Date_Extracted": datetime.now().strftime("%Y-%m-%d"),
+            "Extracted_By": "API Discovery - Semantic Scholar",
+            "abstract": abstract,
+            "is_oa": is_oa,
+            "oa_url": oa_url,
+            "semantic_scholar_id": raw.get("paperId", ""),
+        }
+
+    @staticmethod
+    def _build_citation(authors_list: list, year, title: str, journal: str, doi: str) -> str:
+        names = [a.get("name", "") for a in (authors_list or []) if a.get("name")]
+        if len(names) > 3:
+            citation_authors = f"{names[0]} et al."
+        elif not names:
+            citation_authors = "Unknown"
+        else:
+            citation_authors = "; ".join(names)
+        parts = [f"{citation_authors} ({year or 'n.d.'}). {title}."]
+        if journal:
+            parts.append(f" *{journal}*.")
+        if doi:
+            parts.append(f" https://doi.org/{doi}")
+        return "".join(parts)
+
+    @retry_on_api_error()
+    def search(
+        self,
+        query: str,
+        max_results: int = 50,
+        year_from: int | None = None,
+        year_to: int | None = None,
+        min_citations: int = 0,
+    ) -> list[dict]:
+        """
+        Search Semantic Scholar for papers.
+
+        Args:
+            query: Search string (keep to 4-6 words for best results;
+                   S2 returns 0 for very long queries)
+            max_results: Maximum results (API max per call: 100)
+            year_from: Filter by year >= this
+            year_to: Filter by year <= this
+            min_citations: Minimum citation count (post-filter)
+        """
+        self._rate_limit()
+
+        params = {
+            "query": query,
+            "limit": min(max_results, 100),
+            "fields": self._FIELDS,
+        }
+        if year_from and year_to:
+            params["year"] = f"{year_from}-{year_to}"
+        elif year_from:
+            params["year"] = f"{year_from}-"
+        elif year_to:
+            params["year"] = f"-{year_to}"
+
+        resp = requests.get(
+            f"{self.base_url}/paper/search",
+            params=params,
+            headers=self._headers(),
+            timeout=API_REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        papers = []
+        for raw in data.get("data", []):
+            paper = self._normalize_s2_paper(raw)
+            paper["Search_Query_Source"] = query
+            if min_citations > 0 and int(paper.get("Citation_Count", 0) or 0) < min_citations:
+                continue
+            papers.append(paper)
+
+        return papers
+
+    @retry_on_api_error()
+    def get_by_doi(self, doi: str) -> dict | None:
+        """Fetch a single paper by DOI from Semantic Scholar."""
+        self._rate_limit()
+        clean_doi = _normalize_doi(doi)
+        if not clean_doi:
+            return None
+
+        resp = requests.get(
+            f"{self.base_url}/paper/DOI:{clean_doi}",
+            params={"fields": self._FIELDS},
+            headers=self._headers(),
+            timeout=API_REQUEST_TIMEOUT,
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return self._normalize_s2_paper(resp.json())
+
+
+# ─── CORE API CLIENT ──────────────────────────────────────
+
+class COREClient:
+    """Search and retrieve PDF URLs from CORE API (core.ac.uk)."""
+
+    def __init__(self):
+        from discovery_config import CORE_BASE_URL, CORE_RATE_LIMIT
+        self.base_url = CORE_BASE_URL
+        self._rate_limit_delay = CORE_RATE_LIMIT
+        self._last_request_time = 0.0
+
+    def _rate_limit(self):
+        elapsed = time.time() - self._last_request_time
+        if elapsed < self._rate_limit_delay:
+            time.sleep(self._rate_limit_delay - elapsed)
+        self._last_request_time = time.time()
+
+    def _normalize_core_paper(self, raw: dict) -> dict:
+        """Convert a CORE API result to our normalized dict."""
+        title = raw.get("title", "") or ""
+        doi = _normalize_doi(raw.get("doi", "") or "")
+        year = raw.get("yearPublished")
+        abstract = raw.get("abstract", "") or ""
+        cited_by = raw.get("citationCount", 0) or 0
+
+        authors_list = raw.get("authors") or []
+        authors = "; ".join(a.get("name", "") for a in authors_list if a.get("name"))
+
+        # PDF URLs — prefer source URLs ending in .pdf, then any source URL, then downloadUrl
+        download_url = raw.get("downloadUrl", "") or ""
+        source_urls = raw.get("sourceFulltextUrls") or []
+        oa_url = ""
+        for url in source_urls:
+            if url and url.endswith(".pdf"):
+                oa_url = url
+                break
+        if not oa_url and source_urls:
+            oa_url = source_urls[0]
+        if not oa_url:
+            oa_url = download_url
+
+        is_oa = "Yes" if oa_url else "No"
+
+        # Build paper_id
+        first_author = "Unknown"
+        if authors_list:
+            name = authors_list[0].get("name", "")
+            parts = name.split()
+            first_author = parts[-1] if parts else "Unknown"
+
+        keyword = ""
+        if title:
+            skip_words = {"the", "a", "an", "of", "in", "for", "to", "and", "or", "is", "are", "on", "how", "does", "do"}
+            words = re.sub(r'[^\w\s]', '', title).split()
+            for w in words:
+                if w.lower() not in skip_words and len(w) > 2:
+                    keyword = w
+                    break
+            if not keyword and words:
+                keyword = words[0]
+
+        paper_id = f"{first_author}_{year}_{keyword}" if first_author and year else f"Unknown_{title[:20]}"
+
+        return {
+            "paper_id": paper_id,
+            "title": title,
+            "DOI": doi,
+            "Full_Citation_APA7": "",
+            "Authors": authors,
+            "Year": str(year) if year else "",
+            "Journal": "",
+            "Journal_Tier": "",
+            "Paper_Type": raw.get("documentType", "Journal Article"),
+            "Citation_Count": str(cited_by),
+            "Search_Query_Source": "",
+            "Date_Extracted": datetime.now().strftime("%Y-%m-%d"),
+            "Extracted_By": "API Discovery - CORE",
+            "abstract": abstract,
+            "is_oa": is_oa,
+            "oa_url": oa_url,
+            "core_id": str(raw.get("id", "")),
+        }
+
+    @retry_on_api_error()
+    def search(self, query: str, max_results: int = 20) -> list[dict]:
+        """
+        Search CORE for open-access papers.
+
+        Primary value is PDF sourcing, not search relevance
+        (CORE may return foreign-language theses).
+        """
+        self._rate_limit()
+
+        resp = requests.get(
+            f"{self.base_url}/search/works",
+            params={"q": query, "limit": min(max_results, 100)},
+            timeout=API_REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+
+        papers = []
+        for raw in resp.json().get("results", []):
+            paper = self._normalize_core_paper(raw)
+            paper["Search_Query_Source"] = query
+            papers.append(paper)
+
+        return papers
+
+    @retry_on_api_error()
+    def get_pdf_urls(self, doi: str) -> list[str]:
+        """Look up a DOI in CORE and return available PDF URLs."""
+        self._rate_limit()
+        clean_doi = _normalize_doi(doi)
+        if not clean_doi:
+            return []
+
+        resp = requests.get(
+            f"{self.base_url}/search/works",
+            params={"q": f"doi:{clean_doi}", "limit": 5},
+            timeout=API_REQUEST_TIMEOUT,
+        )
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+
+        urls = []
+        for raw in resp.json().get("results", []):
+            dl = raw.get("downloadUrl", "")
+            if dl:
+                urls.append(dl)
+            for url in (raw.get("sourceFulltextUrls") or []):
+                if url and url not in urls:
+                    urls.append(url)
+
+        return urls
+
+
+# ─── SCI-HUB CLIENT ───────────────────────────────────────
+
+class SciHubClient:
+    """Last-resort PDF retrieval via Sci-Hub by DOI."""
+
+    def __init__(self):
+        from discovery_config import SCIHUB_MIRRORS, SCIHUB_RATE_LIMIT
+        self.mirrors = SCIHUB_MIRRORS
+        self._rate_limit_delay = SCIHUB_RATE_LIMIT
+        self._last_request_time = 0.0
+        self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        })
+
+    def _rate_limit(self):
+        elapsed = time.time() - self._last_request_time
+        if elapsed < self._rate_limit_delay:
+            time.sleep(self._rate_limit_delay - elapsed)
+        self._last_request_time = time.time()
+
+    def get_pdf_url(self, doi: str) -> Optional[str]:
+        """
+        Fetch Sci-Hub page for a DOI and extract the PDF URL.
+
+        Tries each mirror in order. Returns the first successful PDF URL,
+        or None if all mirrors fail.
+        """
+        clean_doi = _normalize_doi(doi)
+        if not clean_doi:
+            return None
+
+        for mirror in self.mirrors:
+            self._rate_limit()
+            try:
+                resp = self._session.get(
+                    f"{mirror}/{clean_doi}",
+                    timeout=20,
+                    allow_redirects=True,
+                )
+                if resp.status_code != 200:
+                    continue
+
+                # Check if response is already a PDF
+                if resp.content[:5] == b"%PDF-":
+                    return f"{mirror}/{clean_doi}"
+
+                text = resp.text
+
+                # Extract PDF URL using regex (no BeautifulSoup dependency)
+                pdf_path = None
+
+                # 1. <meta name="citation_pdf_url" content="...">
+                meta_match = re.search(
+                    r'citation_pdf_url"\s+content="([^"]+)"', text
+                )
+                if meta_match:
+                    pdf_path = meta_match.group(1)
+
+                # 2. <object ... data="...pdf...">
+                if not pdf_path:
+                    obj_match = re.search(
+                        r'<object[^>]+data\s*=\s*"([^"]+\.pdf[^"]*)"', text
+                    )
+                    if obj_match:
+                        pdf_path = obj_match.group(1)
+
+                # 3. <embed ... src="...pdf...">
+                if not pdf_path:
+                    embed_match = re.search(
+                        r'<embed[^>]+src\s*=\s*"([^"]+\.pdf[^"]*)"', text
+                    )
+                    if embed_match:
+                        pdf_path = embed_match.group(1)
+
+                # 4. <iframe ... src="...">
+                if not pdf_path:
+                    iframe_match = re.search(
+                        r'<iframe[^>]+src\s*=\s*"([^"]+)"', text
+                    )
+                    if iframe_match:
+                        pdf_path = iframe_match.group(1)
+
+                if pdf_path:
+                    if pdf_path.startswith("//"):
+                        return f"https:{pdf_path}"
+                    elif pdf_path.startswith("/"):
+                        return f"{mirror}{pdf_path}"
+                    elif not pdf_path.startswith("http"):
+                        return f"{mirror}/{pdf_path}"
+                    return pdf_path
+
+            except (requests.RequestException, Exception):
+                continue
 
         return None

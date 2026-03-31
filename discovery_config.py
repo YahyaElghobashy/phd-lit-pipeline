@@ -40,6 +40,39 @@ DEFAULT_YEAR_RANGE = (2000, 2026)
 DEFAULT_MIN_CITATIONS = 0
 MAX_QUERIES_PER_GAP = 3         # Claude Sonnet generates up to 3 queries per gap
 
+# ─── OPENALEX CONCEPT FILTERING ──────────────────────────────
+# Concept IDs for domain-specific filtering (dramatically improves relevance)
+# Configure these via research_config.yaml concept_ids
+# C2993150066 = Green innovation (Level 2, ~10K works)
+# C126082660 = Digital transformation (Level 2, ~140K works)
+OPENALEX_CONCEPT_IDS = ["C39389867", "C2778397978"]  # Default concepts — override via research_config.yaml
+
+# ─── SEMANTIC SCHOLAR ─────────────────────────────────────────
+SEMANTIC_SCHOLAR_BASE_URL = "https://api.semanticscholar.org/graph/v1"
+SEMANTIC_SCHOLAR_RATE_LIMIT = 3.5       # seconds between requests (no API key)
+SEMANTIC_SCHOLAR_RATE_LIMIT_WITH_KEY = 1.1  # seconds (with free API key)
+
+# ─── CORE API ─────────────────────────────────────────────────
+CORE_BASE_URL = "https://api.core.ac.uk/v3"
+CORE_RATE_LIMIT = 1.0
+
+# ─── SCI-HUB ──────────────────────────────────────────────────
+SCIHUB_MIRRORS = ["https://sci-hub.st", "https://sci-hub.ru"]
+SCIHUB_RATE_LIMIT = 5.0
+
+# ─── RELEVANCE SCREENING ──────────────────────────────────────
+RELEVANCE_SCREEN_THRESHOLD = 0.5
+RELEVANCE_SCREEN_BATCH_SIZE = 15
+RELEVANCE_SCREEN_TIMEOUT = 60
+
+# ─── GOOGLE SCHOLAR SCRAPER ───────────────────────────────────
+SCHOLAR_MIN_DELAY = 5.0
+SCHOLAR_MAX_DELAY = 15.0
+SCHOLAR_CAPTCHA_TIMEOUT = 300
+
+# ─── PDF ACQUISITION CHAIN ───────────────────────────────────
+PDF_SOURCE_CHAIN = ["openalex", "unpaywall", "semantic_scholar", "core", "scihub"]
+
 # ─── CLAUDE MODELS ──────────────────────────────────────────
 CLAUDE_SONNET_MODEL = "claude-sonnet-4-6"   # Lightweight: gap→query conversion
 CLAUDE_OPUS_MODEL = "claude-opus-4-6"       # Deep: extraction + novelty assessment

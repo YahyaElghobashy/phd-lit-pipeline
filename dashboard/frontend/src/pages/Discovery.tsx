@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import Header from '../components/layout/Header'
 import GapSelector from '../components/discovery/GapSelector'
 import QueryEditor from '../components/discovery/QueryEditor'
@@ -57,9 +57,24 @@ export default function Discovery() {
     }
   }, [selectedGapIds, queryClient])
 
+  const scoringPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const [isScoringBg, setIsScoringBg] = useState(false)
+
+  // Clean up polling on unmount
+  useEffect(() => {
+    return () => {
+      if (scoringPollRef.current) clearInterval(scoringPollRef.current)
+    }
+  }, [])
+
   const handleSearch = useCallback(async (selectedQueries: GapQueries) => {
     setIsSearching(true)
-    showToast('Searching OpenAlex + scoring relevance with Claude Sonnet...', 'info')
+    showToast('Searching OpenAlex + Semantic Scholar...', 'info')
+    // Stop any existing scoring poll
+    if (scoringPollRef.current) {
+      clearInterval(scoringPollRef.current)
+      scoringPollRef.current = null
+    }
     try {
       const relevantStatements: Record<string, string> = {}
       for (const gapId of Object.keys(selectedQueries)) {
@@ -69,13 +84,56 @@ export default function Discovery() {
       }
       const response = await api.searchGaps(selectedQueries, relevantStatements)
       setSearchResponse(response)
-      const scoredCount = response.results.filter(r => r.relevance_score !== undefined && r.relevance_score !== null).length
       showToast(
-        `Found ${response.dedup_stats.unique} unique papers` +
-        (scoredCount > 0 ? ` (${scoredCount} scored for relevance)` : '') +
-        ` — ${response.dedup_stats.duplicates_removed} duplicates removed`,
+        `Found ${response.dedup_stats.unique} unique papers — scoring relevance in background...`,
         'success'
       )
+
+      // Start polling for background scoring results
+      if ((response as any).scoring_status === 'started') {
+        setIsScoringBg(true)
+        let pollCount = 0
+        scoringPollRef.current = setInterval(async () => {
+          pollCount++
+          // Safety: stop after 40 polls (~2 minutes)
+          if (pollCount > 40) {
+            clearInterval(scoringPollRef.current!)
+            scoringPollRef.current = null
+            setIsScoringBg(false)
+            return
+          }
+          try {
+            const status = await api.getScoringStatus()
+            if (status.scored_count > 0) {
+              setSearchResponse(prev => {
+                if (!prev) return prev
+                return { ...prev, results: prev.results.map(r => {
+                  const doi = (r as any).DOI || (r as any).doi || ''
+                  const titleKey = ((r as any).title || '').trim().toLowerCase().slice(0, 80)
+                  const key = doi || titleKey
+                  const scored = status.scores[key]
+                  if (scored) {
+                    return { ...r, relevance_score: scored.relevance_score, relevance_reason: scored.relevance_reason }
+                  }
+                  return r
+                })}
+              })
+            }
+            if (!status.is_scoring) {
+              clearInterval(scoringPollRef.current!)
+              scoringPollRef.current = null
+              setIsScoringBg(false)
+              if (status.scored_count > 0) {
+                showToast(`Relevance scoring complete — ${status.scored_count} papers scored`, 'success')
+              }
+            }
+          } catch {
+            clearInterval(scoringPollRef.current!)
+            scoringPollRef.current = null
+            setIsScoringBg(false)
+          }
+        }, 3000)
+      }
     } catch {
       showToast('Search failed — check connection', 'info')
     } finally {
@@ -121,6 +179,12 @@ export default function Discovery() {
           Query generation failed: {genError}
         </div>
       )}
+      {isScoringBg && (
+        <div className="flex-shrink-0 mb-2 px-3 py-2 rounded-lg bg-accent-gold/10 border border-accent-gold/20 flex items-center gap-2 text-xs text-accent-gold">
+          <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeDasharray="32" strokeLinecap="round" /></svg>
+          Claude Sonnet is scoring relevance in the background — scores will appear as they arrive...
+        </div>
+      )}
 
       {/* Scrollable main content */}
       <div className="flex-1 min-h-0 overflow-y-auto pb-4">
@@ -144,6 +208,35 @@ export default function Discovery() {
             selectedPaperDois={selectedPaperDois}
             onPaperSelection={setSelectedPaperDois}
             isSearching={isSearching}
+            isScoringBg={isScoringBg}
+            onAddToVerification={async (papers) => {
+              showToast(`Downloading ${papers.length} paper${papers.length > 1 ? 's' : ''} for gap verification...`, 'info')
+              try {
+                const result = await api.stagePapers(papers, 'verify')
+                showToast(
+                  `${result.downloaded} PDF${result.downloaded !== 1 ? 's' : ''} downloaded` +
+                  (result.download_failed > 0 ? `, ${result.download_failed} failed` : '') +
+                  `. ${result.next_step}`,
+                  result.downloaded > 0 ? 'success' : 'info'
+                )
+              } catch {
+                showToast('Failed to stage papers', 'info')
+              }
+            }}
+            onAddToPaperList={async (papers) => {
+              showToast(`Downloading ${papers.length} paper${papers.length > 1 ? 's' : ''} for extraction...`, 'info')
+              try {
+                const result = await api.stagePapers(papers, 'extract')
+                showToast(
+                  `${result.downloaded} PDF${result.downloaded !== 1 ? 's' : ''} downloaded` +
+                  (result.download_failed > 0 ? `, ${result.download_failed} failed` : '') +
+                  `. ${result.next_step}`,
+                  result.downloaded > 0 ? 'success' : 'info'
+                )
+              } catch {
+                showToast('Failed to stage papers', 'info')
+              }
+            }}
           />
         </div>
 

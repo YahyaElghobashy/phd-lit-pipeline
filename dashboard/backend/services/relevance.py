@@ -26,7 +26,7 @@ TIMEOUT = 60     # seconds per batch
 
 SYSTEM_PROMPT = """\
 You are a research paper relevance assessor for a PhD literature review on \
-board gender diversity, corporate governance, and firm performance.
+the configured research topic and domain.
 
 You will receive a set of research GAPS (statements of what the literature lacks) \
 and a batch of PAPERS (title + abstract).
@@ -42,7 +42,7 @@ Score each paper 0-10:
 
 Return ONLY a JSON array:
 [
-  {"paper_index": 0, "relevance_score": 8, "reason": "Directly studies board gender diversity impact on..."},
+  {"paper_index": 0, "relevance_score": 8, "reason": "Directly studies the core research variables..."},
   {"paper_index": 1, "relevance_score": 2, "reason": "Focuses on unrelated supply chain topic"},
   ...
 ]

@@ -167,6 +167,52 @@ class DiscoveryExtractor:
 
         return extraction
 
+    def extract_from_text(
+        self,
+        text: str,
+        paper_metadata: dict,
+        paper_index: int = 1,
+        total_papers: int = 1,
+    ) -> dict | None:
+        """
+        Extract structured data from full text (not a PDF).
+
+        Writes text to a temporary file, then passes it to the standard
+        extraction pipeline — Claude's Read tool handles .txt files just fine.
+        Cleans up the temp file after extraction.
+
+        Args:
+            text: Full text of the paper
+            paper_metadata: API metadata dict
+            paper_index: 1-based index in current batch
+            total_papers: Total papers in batch
+
+        Returns:
+            Extraction dict or None on failure
+        """
+        paper_id = paper_metadata.get("paper_id", "unknown")
+        safe_id = "".join(c if c.isalnum() or c in "_-" else "_" for c in paper_id)
+        text_path = DISCOVERIES_DIR / f"{safe_id}_fulltext.txt"
+
+        try:
+            # Write full text to temp file
+            with open(text_path, "w", encoding="utf-8") as f:
+                f.write(text)
+
+            console.print(f"  [dim]Wrote {len(text):,} chars to {text_path.name}[/]")
+
+            # Run standard extraction on the text file
+            return self.extract_and_populate(
+                pdf_path=text_path,
+                paper_metadata=paper_metadata,
+                paper_index=paper_index,
+                total_papers=total_papers,
+            )
+        finally:
+            # Clean up temp file
+            if text_path.exists():
+                text_path.unlink()
+
     def _save_discovery(self, extraction: dict, paper_id: str) -> Path:
         """Save extraction JSON to discoveries/ directory."""
         safe_id = "".join(c if c.isalnum() or c in "_-" else "_" for c in paper_id)

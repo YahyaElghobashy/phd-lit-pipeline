@@ -63,7 +63,7 @@ def main():
     import uvicorn
 
     print(f"\n  PhD Pipeline Dashboard")
-    print(f"  Dr. Yara Aboubakr")
+    print(f"  PhD Literature Pipeline")
     print(f"  {'─' * 30}")
     print(f"  API:  {URL}/api/health")
     if FRONTEND_DIST.exists():

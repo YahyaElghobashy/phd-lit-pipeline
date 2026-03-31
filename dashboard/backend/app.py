@@ -19,7 +19,7 @@ FRONTEND_DIST = DASHBOARD_DIR / "frontend" / "dist"
 PIPELINE_DIR = DASHBOARD_DIR.parent
 
 # Try to read researcher name from research_config.yaml for dynamic description
-_description = "Dashboard for Dr. Yara Aboubakr's Literature Extraction Pipeline"
+_description = "PhD Literature Extraction Pipeline Dashboard"
 try:
     import yaml
     _config_path = PIPELINE_DIR / "research_config.yaml"

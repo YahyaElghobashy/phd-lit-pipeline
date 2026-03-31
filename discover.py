@@ -7,9 +7,9 @@ downloads open-access PDFs, extracts structured data, and validates
 gap novelty.
 
 Usage:
-    python discover.py --query "board gender diversity firm performance" --dry-run
+    python discover.py --query "your research topic keywords" --dry-run
     python discover.py --query "women directors financial performance" --max-results 20
-    python discover.py --query "corporate governance gender quota" --year-range 2015 2026 --min-citations 10
+    python discover.py --query "your research domain specific terms" --year-range 2015 2026 --min-citations 10
 """
 from __future__ import annotations
 
@@ -353,12 +353,47 @@ def cmd_run(args):
     report.record_queries(query_results)
     report.end_step("2_generate_queries")
 
-    # ─── Step 3: Search OpenAlex ─────────────────────────────
+    # ─── Step 3: Multi-Source Search ───────────────────────────
     report.start_step("3_search_openalex")
-    console.rule("[bold cyan]Step 3: Searching OpenAlex", style="cyan")
-    openalex = OpenAlexClient()
+    sources = [s.strip() for s in args.sources.split(",")]
+    console.rule(f"[bold cyan]Step 3: Searching ({', '.join(sources)})", style="cyan")
+
+    # Initialize search clients
+    search_clients = {}
+    if "openalex" in sources:
+        search_clients["openalex"] = OpenAlexClient()
+    if "semantic_scholar" in sources:
+        from api_clients import SemanticScholarClient
+        search_clients["semantic_scholar"] = SemanticScholarClient()
+    if "core" in sources:
+        from api_clients import COREClient
+        search_clients["core"] = COREClient()
+
+    # Concept IDs for OpenAlex filtering
+    concept_ids = None
+    if "openalex" in sources and not getattr(args, 'no_concept_filter', False):
+        from discovery_config import OPENALEX_CONCEPT_IDS
+        concept_ids = OPENALEX_CONCEPT_IDS
+        console.print(f"  [dim]OpenAlex concept filter: {concept_ids}[/]")
+
     all_papers = []  # All raw results
     seen_dois = set()  # Track DOIs to avoid cross-query duplicates
+    seen_titles = set()  # Also track titles for papers without DOIs
+
+    def _add_paper(p, gap_id, query_str):
+        """Add paper to results if not a duplicate."""
+        p["Search_Query_Source"] = query_str
+        p["_gap_id"] = gap_id
+        doi = p.get("DOI", "")
+        title_key = p.get("title", "").strip().lower()[:80]
+        if doi and doi not in seen_dois:
+            seen_dois.add(doi)
+            if title_key:
+                seen_titles.add(title_key)
+            all_papers.append(p)
+        elif not doi and title_key and title_key not in seen_titles:
+            seen_titles.add(title_key)
+            all_papers.append(p)
 
     for gap_result in query_results:
         gap_id = gap_result.get("gap_id", "?")
@@ -374,32 +409,71 @@ def cmd_run(args):
                 console.print(f"    [dim]Skipping (already searched): {query_str}[/]")
                 continue
 
-            try:
-                papers = openalex.search(
-                    query=query_str,
-                    max_results=args.max_results,
-                    year_from=year_range[0],
-                    year_to=year_range[1],
-                    min_citations=args.min_citations,
-                )
-                console.print(f"    [{angle}] \"{query_str}\" → {len(papers)} results")
+            # Search each enabled source
+            for source_name, client in search_clients.items():
+                try:
+                    if source_name == "openalex":
+                        papers = client.search(
+                            query=query_str,
+                            max_results=args.max_results,
+                            year_from=year_range[0],
+                            year_to=year_range[1],
+                            min_citations=args.min_citations,
+                            concept_ids=concept_ids,
+                        )
+                    elif source_name == "semantic_scholar":
+                        papers = client.search(
+                            query=query_str,
+                            max_results=min(args.max_results, 50),
+                            year_from=year_range[0],
+                            year_to=year_range[1],
+                            min_citations=args.min_citations,
+                        )
+                    elif source_name == "core":
+                        papers = client.search(
+                            query=query_str,
+                            max_results=min(args.max_results, 20),
+                        )
+                    else:
+                        papers = []
 
-                # Add gap context to papers
-                for p in papers:
-                    p["Search_Query_Source"] = query_str
-                    p["_gap_id"] = gap_id
+                    console.print(f"    [{angle}] \"{query_str}\" ({source_name}) → {len(papers)} results")
 
-                    doi = p.get("DOI", "")
-                    if doi and doi not in seen_dois:
-                        seen_dois.add(doi)
-                        all_papers.append(p)
+                    for p in papers:
+                        _add_paper(p, gap_id, query_str)
 
-                state.mark_query_searched(query_str)
+                except Exception as e:
+                    console.print(f"    [red]{source_name} failed: {e}[/]")
 
-            except Exception as e:
-                console.print(f"    [red]Search failed: {e}[/]")
+            state.mark_query_searched(query_str)
 
         state.mark_gap_processed(gap_id)
+
+    # Google Scholar (if enabled) — handled separately due to browser lifecycle
+    if "scholar" in sources:
+        console.print(f"\n  [bold blue]Google Scholar search...[/]")
+        try:
+            from google_scholar_scraper import GoogleScholarScraper
+            with GoogleScholarScraper(headless=False) as scraper:
+                for gap_result in query_results:
+                    gap_id = gap_result.get("gap_id", "?")
+                    queries = gap_result.get("queries", [])
+                    for q in queries[:1]:  # Only first query per gap (Scholar is rate-sensitive)
+                        query_str = q.get("query", "")
+                        try:
+                            papers = scraper.search(
+                                query=query_str,
+                                max_results=min(args.max_results, 10),
+                                year_from=year_range[0],
+                                year_to=year_range[1],
+                            )
+                            console.print(f"    [scholar] \"{query_str}\" → {len(papers)} results")
+                            for p in papers:
+                                _add_paper(p, gap_id, query_str)
+                        except Exception as e:
+                            console.print(f"    [red]Scholar failed: {e}[/]")
+        except ImportError:
+            console.print("  [yellow]Google Scholar scraper not available (install playwright)[/]")
 
     console.print(f"\n  [bold green]Total unique papers found: {len(all_papers)}[/]\n")
     state.update_stats(total_gaps=len(gaps_to_process), total_queries=total_queries, total_results=len(all_papers))
@@ -411,6 +485,31 @@ def cmd_run(args):
         report_path = report.save()
         console.print(f"  [dim]Report: {report_path}[/]")
         return 0
+
+    # ─── Step 3b: Relevance Screening ──────────────────────────
+    skip_screening = hasattr(args, 'skip_screening') and args.skip_screening
+    if not skip_screening and all_papers:
+        console.rule("[bold cyan]Step 3b: Relevance Screening", style="cyan")
+        try:
+            from relevance_screener import screen_batch
+            threshold = getattr(args, 'relevance_threshold', 0.5)
+            console.print(f"  [dim]Threshold: {threshold}[/]")
+
+            relevant_papers, filtered_papers = screen_batch(all_papers, threshold=threshold)
+            console.print(f"  Relevant: [bold green]{len(relevant_papers)}[/]")
+            console.print(f"  Filtered out: [yellow]{len(filtered_papers)}[/]")
+
+            if filtered_papers:
+                console.print("\n  [dim]Sample filtered:[/]")
+                for p in filtered_papers[:5]:
+                    score = p.get('_relevance_score', 0)
+                    console.print(f"    [{score:.2f}] {p.get('title', '')[:60]}")
+
+            all_papers = relevant_papers
+        except Exception as e:
+            console.print(f"  [yellow]Screening failed ({e}) — passing all papers through[/]")
+    elif skip_screening:
+        console.print("\n[dim]Relevance screening skipped (--skip-screening)[/]")
 
     # ─── Step 4: Deduplicate ─────────────────────────────────
     report.start_step("4_dedup")
@@ -450,12 +549,14 @@ def cmd_run(args):
     console.rule("[bold cyan]Step 5: Downloading PDFs & Checking Unpaywall", style="cyan")
     downloader = PDFDownloader()
 
-    # Filter to papers with OA access or DOIs (for Unpaywall lookup)
+    # Filter to papers with DOIs (cascading PDF chain can find most via DOI)
+    # or papers that already have OA URLs
     downloadable = [p for p in new_papers if p.get("is_oa") == "Yes" or p.get("DOI")]
-    console.print(f"  Papers with potential OA access: {len(downloadable)}")
+    console.print(f"  Papers with DOI or OA URL: {len(downloadable)}")
     console.print(f"  Papers without DOI/OA: {len(new_papers) - len(downloadable)}\n")
 
-    dl_results = downloader.download_batch(downloadable)
+    use_scihub = not getattr(args, 'no_scihub', False)
+    dl_results = downloader.download_batch(downloadable, use_scihub=use_scihub)
 
     # Track results in state
     for paper, path in dl_results["downloaded"]:
@@ -649,10 +750,10 @@ def build_parser() -> argparse.ArgumentParser:
 Examples:
   python discover.py --run --gap-limit 3 --dry-run          # Full pipeline dry-run (3 gaps)
   python discover.py --run --gap-limit 5 --min-citations 10  # Run for 5 gaps, min 10 citations
-  python discover.py --query "board gender diversity" --dry-run  # Ad-hoc search
+  python discover.py --query "your research topic" --dry-run  # Ad-hoc search
   python discover.py --setup-sheet                            # Create auto extraction sheet
   python discover.py --build-queries --dry-run                # Preview gap queries
-  python discover.py --dedup --query "board gender diversity" # Test dedup
+  python discover.py --dedup --query "your research topic" # Test dedup
   python discover.py --novelty                                # Run novelty assessment
   python discover.py --status                                 # Pipeline status dashboard
   python discover.py --report                                 # View latest run report
@@ -749,6 +850,35 @@ Examples:
         "--dry-run",
         action="store_true",
         help="Preview only — no downloads, no sheet writes, no sheet creation",
+    )
+
+    # Multi-source options
+    parser.add_argument(
+        "--sources",
+        type=str,
+        default="openalex,semantic_scholar",
+        help="Comma-separated search sources: openalex,semantic_scholar,core,scholar (default: openalex,semantic_scholar)",
+    )
+    parser.add_argument(
+        "--no-concept-filter",
+        action="store_true",
+        help="Disable OpenAlex concept filtering (configured research domain concepts)",
+    )
+    parser.add_argument(
+        "--no-scihub",
+        action="store_true",
+        help="Disable Sci-Hub in the PDF acquisition chain",
+    )
+    parser.add_argument(
+        "--skip-screening",
+        action="store_true",
+        help="Skip abstract-based relevance screening",
+    )
+    parser.add_argument(
+        "--relevance-threshold",
+        type=float,
+        default=0.5,
+        help="Relevance screening threshold (default: 0.5)",
     )
 
     return parser

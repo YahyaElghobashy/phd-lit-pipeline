@@ -401,7 +401,7 @@ Return ONLY a valid JSON object matching the schema below. No markdown wrapping,
   "3_VARIABLES": {{
     "PAPER_ID": "",
     "DV1_Name": "", "DV1_Measurement": "How measured (formula/proxy/index)",
-    "DV1_Source": "Data source (e.g., Refinitiv, hand-collected)",
+    "DV1_Source": "Data source (e.g., database name, hand-collected)",
     "DV1_Category": "One of: {dv_cat_str}",
     "DV1_Relevance_To_Us": "One of: {dv_rel_str}",
     "DV2_Name": "", "DV2_Measurement": "", "DV2_Source": "", "DV2_Category": "",

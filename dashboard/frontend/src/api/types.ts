@@ -181,6 +181,28 @@ export interface CachedQueryEntry {
 
 export type CachedQueries = Record<string, CachedQueryEntry>
 
+// ── Scoring & Staging Types ─────────────────────────────────────────
+
+export interface ScoringStatus {
+  is_scoring: boolean
+  scored_count: number
+  request_id: string
+  scores: Record<string, { relevance_score: number; relevance_reason: string }>
+}
+
+export interface StagePapersResponse {
+  status: string
+  action: string
+  total_papers: number
+  dois_count: number
+  staged_file: string
+  downloaded: number
+  download_failed: number
+  downloads: Array<{ paper_id: string; title: string; pdf_path: string; source: string }>
+  failures: Array<{ paper_id: string; title: string; reason: string }>
+  next_step: string
+}
+
 // ── Admin Types ─────────────────────────────────────────────────────
 
 export interface AdminConfig {

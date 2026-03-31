@@ -44,6 +44,33 @@ class GapSearchRequest(BaseModel):
     skip_relevance: bool = False
 
 
+# ── Deduplicator cache (avoid reloading sheets on every search) ────────
+_dedup_cache = {"instance": None, "loaded_at": 0.0}
+_DEDUP_CACHE_TTL = 300  # 5 minutes
+
+def _get_deduplicator():
+    """Get a cached Deduplicator instance (reloads sheets every 5 min)."""
+    import time
+    now = time.time()
+    if _dedup_cache["instance"] is None or (now - _dedup_cache["loaded_at"]) > _DEDUP_CACHE_TTL:
+        from deduplicator import Deduplicator
+        dedup = Deduplicator()
+        dedup.load_existing()
+        _dedup_cache["instance"] = dedup
+        _dedup_cache["loaded_at"] = now
+    return _dedup_cache["instance"]
+
+
+# ── Background relevance scoring state ────────────────────────────────
+import threading
+_scoring_state = {
+    "is_scoring": False,
+    "scores": {},       # doi -> {relevance_score, relevance_reason}
+    "request_id": "",   # tracks which search the scores belong to
+}
+_scoring_lock = threading.Lock()
+
+
 class PipelineRequest(BaseModel):
     action: str  # "full" | "download" | "extract" | "analyze"
     gap_limit: int = 5
@@ -56,17 +83,19 @@ class PipelineRequest(BaseModel):
 
 @router.post("/search")
 async def discover_search(req: SearchRequest):
-    """Search OpenAlex for papers matching the query."""
+    """Search OpenAlex for papers matching the query (with concept filtering)."""
     try:
         from api_clients import OpenAlexClient
+        from discovery_config import OPENALEX_CONCEPT_IDS
 
-        client = OpenAlexClient(mailto="yara.aboubakr@research.edu")
+        client = OpenAlexClient(mailto="researcher@example.edu")
         results = client.search(
             query=req.query,
             max_results=req.max_results,
             year_from=req.year_from,
             year_to=req.year_to,
             min_citations=req.min_citations,
+            concept_ids=OPENALEX_CONCEPT_IDS,
         )
         return {"query": req.query, "count": len(results), "papers": results}
     except ImportError:
@@ -210,72 +239,175 @@ async def delete_gap_queries(gap_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── 3. Batch search with deduplication + AI relevance ────────────────────
+# ── 3. Batch search with deduplication + background AI relevance ──────
+
+def _run_scoring_background(papers: list[dict], gap_statements: dict[str, str], request_id: str):
+    """Run Claude Sonnet relevance scoring in a background thread."""
+    try:
+        from ..services.relevance import assess_relevance
+        new_papers = [p for p in papers if not p.get("is_known")]
+        if not new_papers:
+            return
+
+        with _scoring_lock:
+            _scoring_state["is_scoring"] = True
+            _scoring_state["request_id"] = request_id
+
+        scores = assess_relevance(new_papers, gap_statements)
+        score_map = {s["paper_index"]: s for s in scores}
+
+        with _scoring_lock:
+            for i, paper in enumerate(new_papers):
+                sc = score_map.get(i, {})
+                doi = paper.get("DOI", "") or paper.get("doi", "")
+                title_key = (paper.get("title") or "").strip().lower()[:80]
+                key = doi or title_key
+                if key:
+                    _scoring_state["scores"][key] = {
+                        "relevance_score": sc.get("relevance_score", 0),
+                        "relevance_reason": sc.get("reason", ""),
+                    }
+            _scoring_state["is_scoring"] = False
+    except Exception as e:
+        print(f"[scoring-bg] Failed: {e}")
+        with _scoring_lock:
+            _scoring_state["is_scoring"] = False
+
+
+@router.get("/scoring-status")
+async def get_scoring_status():
+    """Poll for background relevance scoring results."""
+    with _scoring_lock:
+        return {
+            "is_scoring": _scoring_state["is_scoring"],
+            "scored_count": len(_scoring_state["scores"]),
+            "request_id": _scoring_state["request_id"],
+            "scores": dict(_scoring_state["scores"]),
+        }
+
 
 @router.post("/search-gaps")
 async def search_gaps(req: GapSearchRequest):
-    """Search OpenAlex for all gap queries, deduplicate, and optionally
-    score relevance with Claude Sonnet."""
+    """Search OpenAlex + Semantic Scholar, deduplicate, return results immediately.
+
+    Relevance scoring runs in background — poll /scoring-status for results.
+    Results appear instantly; scores trickle in via polling.
+    """
     try:
         from api_clients import OpenAlexClient
+        from discovery_config import OPENALEX_CONCEPT_IDS
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        client = OpenAlexClient(mailto="yara.aboubakr@research.edu")
+        client = OpenAlexClient(mailto="researcher@example.edu")
+
+        # Try Semantic Scholar
+        s2_client = None
+        try:
+            from api_clients import SemanticScholarClient
+            s2_client = SemanticScholarClient()
+        except Exception:
+            pass
 
         all_results = []
         seen_dois: set[str] = set()
+        seen_titles: set[str] = set()
         total_found = 0
 
-        for gap_id, queries in req.queries.items():
-            for query in queries:
-                results = client.search(
+        def _add_paper(paper, gap_id):
+            nonlocal total_found
+            doi = paper.get("doi", "") or paper.get("DOI", "")
+            title_key = (paper.get("title") or "").strip().lower()[:80]
+            if doi and doi in seen_dois:
+                return
+            if doi:
+                seen_dois.add(doi)
+            if not doi and title_key and title_key in seen_titles:
+                return
+            if title_key:
+                seen_titles.add(title_key)
+            paper["source_gap_id"] = gap_id
+            all_results.append(paper)
+
+        def _search_openalex(query, gap_id):
+            return ("openalex", gap_id, client.search(
+                query=query,
+                max_results=req.max_results,
+                year_from=req.year_from,
+                year_to=req.year_to,
+                min_citations=req.min_citations,
+                concept_ids=OPENALEX_CONCEPT_IDS,
+            ))
+
+        def _search_s2(query, gap_id):
+            if not s2_client:
+                return ("s2", gap_id, [])
+            try:
+                return ("s2", gap_id, s2_client.search(
                     query=query,
-                    max_results=req.max_results,
+                    max_results=min(req.max_results, 20),
                     year_from=req.year_from,
                     year_to=req.year_to,
                     min_citations=req.min_citations,
-                )
-                total_found += len(results)
+                ))
+            except Exception:
+                return ("s2", gap_id, [])
 
-                for paper in results:
-                    doi = paper.get("doi", "") or paper.get("DOI", "")
-                    if doi and doi in seen_dois:
-                        continue
-                    if doi:
-                        seen_dois.add(doi)
-                    paper["source_gap_id"] = gap_id
-                    all_results.append(paper)
+        # Parallel search: OpenAlex + S2 for all queries at once
+        futures = []
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            for gap_id, queries in req.queries.items():
+                for query in queries:
+                    futures.append(executor.submit(_search_openalex, query, gap_id))
+                    if s2_client:
+                        futures.append(executor.submit(_search_s2, query, gap_id))
 
-        # Deduplicator pass
+            for future in as_completed(futures):
+                try:
+                    source, gap_id, results = future.result()
+                    total_found += len(results)
+                    for paper in results:
+                        _add_paper(paper, gap_id)
+                except Exception:
+                    pass
+
+        # Deduplicator pass (cached — no sheet reload if <5 min old)
         try:
-            from deduplicator import Deduplicator
-            dedup = Deduplicator()
+            dedup = _get_deduplicator()
             unique = []
             for paper in all_results:
                 is_dup, _reason = dedup.is_duplicate(paper)
                 paper["is_known"] = is_dup
                 unique.append(paper)
-        except ImportError:
+        except Exception:
             unique = all_results
             for p in unique:
                 p["is_known"] = False
 
-        # AI relevance scoring (optional)
-        if not req.skip_relevance and req.gap_statements and unique:
-            try:
-                from ..services.relevance import assess_relevance
-                new_papers = [p for p in unique if not p.get("is_known")]
-                if new_papers:
-                    scores = assess_relevance(new_papers, req.gap_statements)
-                    score_map = {s["paper_index"]: s for s in scores}
-                    for i, paper in enumerate(new_papers):
-                        sc = score_map.get(i, {})
-                        paper["relevance_score"] = sc.get("relevance_score", 0)
-                        paper["relevance_reason"] = sc.get("reason", "")
-            except Exception as e:
-                print(f"[search-gaps] Relevance scoring failed: {e}")
-                # Continue without scores
+        # Apply any existing background scores from previous search
+        with _scoring_lock:
+            for paper in unique:
+                doi = paper.get("DOI", "") or paper.get("doi", "")
+                title_key = (paper.get("title") or "").strip().lower()[:80]
+                key = doi or title_key
+                if key and key in _scoring_state["scores"]:
+                    cached = _scoring_state["scores"][key]
+                    paper["relevance_score"] = cached["relevance_score"]
+                    paper["relevance_reason"] = cached["relevance_reason"]
 
         duplicates_removed = total_found - len([p for p in unique if not p.get("is_known")])
+
+        # Start background relevance scoring (non-blocking)
+        if not req.skip_relevance and req.gap_statements and unique:
+            import hashlib
+            request_id = hashlib.md5(str(sorted(req.queries.keys())).encode()).hexdigest()[:8]
+            with _scoring_lock:
+                _scoring_state["scores"] = {}  # Clear old scores for new search
+            scoring_thread = threading.Thread(
+                target=_run_scoring_background,
+                args=(unique, req.gap_statements, request_id),
+                daemon=True,
+            )
+            scoring_thread.start()
 
         return {
             "results": unique,
@@ -285,6 +417,7 @@ async def search_gaps(req: GapSearchRequest):
                 "unique": len([p for p in unique if not p.get("is_known")]),
                 "already_known": len([p for p in unique if p.get("is_known")]),
             },
+            "scoring_status": "started" if not req.skip_relevance and req.gap_statements else "skipped",
         }
     except ImportError:
         raise HTTPException(
@@ -457,5 +590,96 @@ async def run_dedup_backfill(req: DedupBackfillRequest):
             "clusters": dup_clusters,
             "applied": req.apply,
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── 9. Paper action endpoints (Add to Pipeline / Verify Gaps) ─────────
+
+import json as _json
+
+_STAGED_PAPERS_FILE = PIPELINE_DIR / "discoveries" / "staged_papers.json"
+
+
+class PaperActionRequest(BaseModel):
+    papers: list[dict]  # Normalized paper dicts from search results
+    action: str = "extract"  # "extract" (add to pipeline) or "verify" (gap analysis)
+
+
+def _stage_papers(papers: list[dict]) -> Path:
+    """Save selected papers to a staging file for the pipeline to process."""
+    _STAGED_PAPERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(_STAGED_PAPERS_FILE, "w") as f:
+        _json.dump(papers, f, indent=2, ensure_ascii=False)
+    return _STAGED_PAPERS_FILE
+
+
+@router.post("/stage-papers")
+async def stage_papers(req: PaperActionRequest):
+    """Stage selected papers for pipeline processing.
+
+    Saves paper metadata to a staging file, then triggers
+    the appropriate pipeline action via process_runner.
+
+    Actions:
+    - "extract": Download PDFs + full 12-section extraction + sheet population
+    - "verify": Download PDFs + gap matrix analysis only (verify/attack gaps)
+    """
+    if not req.papers:
+        raise HTTPException(status_code=400, detail="No papers provided")
+
+    try:
+        # Stage the papers
+        staged_path = _stage_papers(req.papers)
+        paper_count = len(req.papers)
+        dois = [p.get("DOI", p.get("doi", "")) for p in req.papers if p.get("DOI") or p.get("doi")]
+
+        # Download PDFs for staged papers
+        downloaded = []
+        failed = []
+
+        from pdf_downloader import PDFDownloader
+        downloader = PDFDownloader()
+
+        for paper in req.papers:
+            try:
+                pdf_path = downloader.download_paper(paper, use_scihub=True)
+                if pdf_path:
+                    downloaded.append({
+                        "paper_id": paper.get("paper_id", "unknown"),
+                        "title": paper.get("title", "")[:60],
+                        "pdf_path": str(pdf_path),
+                        "source": paper.get("_pdf_source", "unknown"),
+                    })
+                else:
+                    failed.append({
+                        "paper_id": paper.get("paper_id", "unknown"),
+                        "title": paper.get("title", "")[:60],
+                        "reason": "No PDF found across all sources",
+                    })
+            except Exception as e:
+                failed.append({
+                    "paper_id": paper.get("paper_id", "unknown"),
+                    "title": paper.get("title", "")[:60],
+                    "reason": str(e)[:100],
+                })
+
+        return {
+            "status": "staged",
+            "action": req.action,
+            "total_papers": paper_count,
+            "dois_count": len(dois),
+            "staged_file": str(staged_path),
+            "downloaded": len(downloaded),
+            "download_failed": len(failed),
+            "downloads": downloaded,
+            "failures": failed,
+            "next_step": (
+                "Run 'Full Pipeline' or 'Gap Analysis' from the Pipeline section below"
+                if downloaded
+                else "No PDFs could be downloaded. Papers saved as metadata."
+            ),
+        }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

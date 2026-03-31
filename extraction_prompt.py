@@ -17,20 +17,10 @@ def build_system_prompt() -> str:
 
 # PHD RESEARCH CONTEXT
 
-This pipeline serves a three-paper PhD dissertation: "Women on Boards: An International Study in Governance and Wealth Creation."
+This pipeline serves a PhD dissertation configured via research_config.yaml.
+Run `python setup_wizard.py` to configure your research context, then `python -m codegen.generate_extraction_prompt` to regenerate this file.
 
-The research examines how board gender diversity and director characteristics (education, experience, busyness, tenure, executive status, time-to-retirement, etc.) affect NON-MONETARY wealth creation:
-- Paper 1: Technology & Digital Transformation outcomes
-- Paper 2: Environmental Sustainability / ESG outcomes
-- Paper 3: Innovation as a mediating pathway
-
-CRITICAL: WEALTH ≠ MONEY. The dependent variables are sustainability scores, innovation metrics, green patents, R&D efficiency, digital transformation indices — NOT ROA, Tobin's Q, or stock returns. Financial measures are controls only.
-
-Available databases: BoardEx (board composition) and Thomson Reuters/Refinitiv (financials, ESG, patents).
-
-Key scholars: Renée Adams (methodology), Alice Eagly (social role theory).
-
-Theories: Agency, Resource Dependence, Upper Echelons, Social Role (Eagly), Stakeholder, Critical Mass (Kanter), Human Capital, Institutional.
+[PLACEHOLDER: Research context will be injected by codegen from research_config.yaml]
 
 # YOUR TASK
 
@@ -50,7 +40,7 @@ Return ONLY a valid JSON object matching the schema below. No markdown wrapping,
 # EXTRACTION SCHEMA
 
 {
-  "paper_id": "FirstAuthor_Year_Keyword (e.g., Adams_2009_Women)",
+  "paper_id": "FirstAuthor_Year_Keyword (e.g., Smith_2020_Topic)",
 
   "Verbatim_Abstract": "The paper's abstract copied EXACTLY word-for-word from the PDF. Do not paraphrase or summarize. If no abstract section exists, use empty string.",
 
@@ -85,12 +75,12 @@ Return ONLY a valid JSON object matching the schema below. No markdown wrapping,
   "3_VARIABLES": {
     "PAPER_ID": "",
     "DV1_Name": "", "DV1_Measurement": "How measured (formula/proxy/index)",
-    "DV1_Source": "Data source (e.g., Refinitiv, hand-collected)",
+    "DV1_Source": "Data source (e.g., database name, hand-collected)",
     "DV1_Category": "One of: Financial Performance | ESG-Sustainability | Innovation-Patents | Digital-Technology | Risk | Other",
     "DV1_Relevance_To_Us": "One of: Direct match Paper1 | Direct match Paper2 | Direct match Paper3 | Useful proxy | Control in our framework | Not relevant",
     "DV2_Name": "", "DV2_Measurement": "", "DV2_Source": "", "DV2_Category": "",
     "IV1_Name": "", "IV1_Measurement": "",
-    "IV1_Type": "One of: Gender diversity measure | Board characteristic | Firm characteristic | Other",
+    "IV1_Type": "One of: [configured via research_config.yaml]",
     "IV1_Detail": "Detailed description of how this IV is operationalized",
     "IV1_Role_In_Our_Framework": "One of: Focal IV | Key moderator | Board control | Firm control | Not in our framework",
     "IV2_Name": "", "IV2_Measurement": "", "IV2_Type": "", "IV2_Detail": "",
@@ -145,8 +135,8 @@ Return ONLY a valid JSON object matching the schema below. No markdown wrapping,
     "Theory_Application_Quality": "One of: Deep integration | Surface citation | Token mention | No theory",
     "Theoretical_Predictions_Tested": "",
     "Theoretical_Contribution": "One of: Extends theory | Confirms theory | Challenges theory | Combines theories | None",
-    "Cites_Adams": "Yes | No", "Adams_Paper_Cited": "",
-    "Cites_Eagly": "Yes | No", "Eagly_Paper_Cited": "",
+    "Cites_Scholar1": "Yes | No", "Scholar1_Paper_Cited": "",
+    "Cites_Scholar2": "Yes | No", "Scholar2_Paper_Cited": "",
     "Connection_To_Our_Theories": "How this paper's theoretical framework relates to ours"
   },
 
@@ -191,7 +181,7 @@ Return ONLY a valid JSON object matching the schema below. No markdown wrapping,
 
   "10_CLASSIFICATION": {
     "PAPER_ID": "",
-    "Primary_Theme": "MUST be exactly one of: BGD→Firm Performance | BGD→Digital Transformation | BGD→Environmental Innovation | BGD→Sustainability-ESG | Board Chars→Innovation | Board Chars→Performance | DT→Corporate Governance | Methodology-Causal ID | Theoretical Framework | Other",
+    "Primary_Theme": "One of: [configured via research_config.yaml themes]",
     "Secondary_Theme": "Same options as Primary_Theme, or empty",
     "Paper_Assignment": "MUST be exactly one of: Paper 1: Technology | Paper 2: Sustainability | Paper 3: Innovation | Multiple | Background-Contextual | Methodology Reference",
     "Use_Case_Theory": "Yes or No — does this paper inform our theoretical framework?",
@@ -212,8 +202,8 @@ Return ONLY a valid JSON object matching the schema below. No markdown wrapping,
 
   "11_CONNECTIONS": {
     "PAPER_ID": "",
-    "Cites_Adams": "Yes | No", "Adams_Paper_Cited": "",
-    "Cites_Eagly": "Yes | No", "Eagly_Paper_Cited": "",
+    "Cites_Scholar1": "Yes | No", "Scholar1_Paper_Cited": "",
+    "Cites_Scholar2": "Yes | No", "Scholar2_Paper_Cited": "",
     "Important_Refs_To_Add": "Key references we should also review",
     "Related_Papers_In_DB": "Papers already in our database that relate",
     "Builds_On": "", "Contradicts": "",
@@ -326,7 +316,7 @@ The Google Sheet has data validation dropdowns. You MUST use EXACTLY one of the 
 - H*_Supported: "Yes" | "No" | "Partially" | "Not tested"
 - DV*_Category: "Financial Performance" | "ESG-Sustainability" | "Innovation-Patents" | "Digital-Technology" | "Risk" | "Other"
 - DV*_Relevance_To_Us: "Direct match Paper1" | "Direct match Paper2" | "Direct match Paper3" | "Useful proxy" | "Control in our framework" | "Not relevant"
-- IV*_Type: "Gender diversity measure" | "Board characteristic" | "Firm characteristic" | "Other"
+- IV*_Type: [configured via research_config.yaml]
 - IV*_Role_In_Our_Framework: "Focal IV" | "Key moderator" | "Board control" | "Firm control" | "Not in our framework"
 - Research_Design: "Cross-sectional" | "Panel-balanced" | "Panel-unbalanced" | "Event study" | "Quasi-experiment" | "DiD" | "RDD" | "Qualitative" | "Mixed" | "SLR/Bibliometric"
 - Estimation_Primary: "OLS" | "Fixed Effects" | "Random Effects" | "System GMM" | "Difference GMM" | "2SLS-IV" | "3SLS" | "Tobit" | "Logit" | "Probit" | "Heckman" | "PSM" | "DiD" | "Quantile Reg" | "SEM" | "Meta-regression" | "Other"
@@ -338,13 +328,13 @@ The Google Sheet has data validation dropdowns. You MUST use EXACTLY one of the 
 - Theory_Application_Quality: "Deep integration" | "Surface citation" | "Token mention" | "No theory"
 - Theoretical_Contribution: "Extends theory" | "Confirms theory" | "Challenges theory" | "Combines theories" | "None"
 - Effect_Direction: "Positive" | "Negative" | "Mixed" | "Null" | "Non-linear U" | "Non-linear inverted-U"
-- Primary_Theme: "BGD→Firm Performance" | "BGD→Digital Transformation" | "BGD→Environmental Innovation" | "BGD→Sustainability-ESG" | "Board Chars→Innovation" | "Board Chars→Performance" | "DT→Corporate Governance" | "Methodology-Causal ID" | "Theoretical Framework" | "Other"
+- Primary_Theme: [configured via research_config.yaml themes]
 - Paper_Assignment: "Paper 1: Technology" | "Paper 2: Sustainability" | "Paper 3: Innovation" | "Multiple" | "Background-Contextual" | "Methodology Reference"
 - All Use_Case_* fields: "Yes" | "No"
 - Informs_Our_IV / Informs_Our_DV / Suggests_Moderators / Suggests_Mediators / Suggests_Controls: "Yes" | "No"
 - All *_Examined fields in 12_BOARD_CHARS: "Yes" | "No"
 - Critical_Mass_Tested: "Yes" | "No"
-- Cites_Adams / Cites_Eagly: "Yes" | "No"
+- Cites_Scholar1 / Cites_Scholar2: "Yes" | "No" — key scholars configured via research_config.yaml
 - Replication_Possible_With_Our_Data: "Yes" | "No" | "Partially"
 - Data_Available (GAP_TRACKER): "Yes" | "No" | "Partially"
 

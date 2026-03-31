@@ -29,7 +29,7 @@ class PipelineDisplay:
         """Display pipeline header banner."""
         content = Text()
         content.append("PhD LITERATURE EXTRACTION PIPELINE\n", style="bold cyan")
-        content.append("Yara Aboubakr PhD Research Literature Review\n\n", style="dim")
+        content.append("PhD Research Literature Review Pipeline\n\n", style="dim")
         content.append(f"📂 Folder: {root}\n")
         content.append(f"📄 PDFs found: {total_pdfs} unprocessed\n")
         content.append(f"✅ Already done: {already_done}\n")

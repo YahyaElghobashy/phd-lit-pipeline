@@ -51,6 +51,9 @@ export const api = {
       body: JSON.stringify({ queries, gap_statements: gapStatements ?? {}, ...options }),
     }),
 
+  getScoringStatus: () =>
+    fetchJSON<import('./types').ScoringStatus>('/api/discover/scoring-status'),
+
   runDiscoveryPipeline: (action: string, flags?: Record<string, unknown>) =>
     fetchJSON<{ pid: number; command: string }>('/api/discover/run-pipeline', {
       method: 'POST',
@@ -76,6 +79,12 @@ export const api = {
   deleteQueries: (gapId: string) =>
     fetchJSON<{ gap_id: string; status: string }>(`/api/discover/queries/${gapId}`, {
       method: 'DELETE',
+    }),
+
+  stagePapers: (papers: Record<string, unknown>[], action: 'extract' | 'verify') =>
+    fetchJSON<import('./types').StagePapersResponse>('/api/discover/stage-papers', {
+      method: 'POST',
+      body: JSON.stringify({ papers, action }),
     }),
 
   // ── Admin ─────────────────────────────────────────────────────

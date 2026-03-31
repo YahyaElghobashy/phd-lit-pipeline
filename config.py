@@ -60,11 +60,6 @@ SHEETS_WRITE_DELAY = 2.0  # seconds between tab writes (rate limiting)
 SHEETS_MAX_RETRIES = 5
 SHEETS_RETRY_BASE_DELAY = 5.0  # exponential: 5s, 10s, 20s, 40s, 80s
 
-# ─── GAP COVERAGE ANALYZER (DEPRECATED — replaced by GAP_MATRIX_ANALYZER) ──
-# GAP_COVERAGE_TAB = "GAP_COVERAGE_MAP"   # Legacy: use GAP_MATRIX_TAB instead
-# GAP_ANALYSIS_TIMEOUT = 300
-# GAP_ANALYSIS_MAX_RETRIES = 2
-# GAP_ANALYSIS_RETRY_DELAY = 30
 GAP_BATCH_SIZE = 75  # Max gaps per Claude call; if total > this, split into batches
 
 # ─── GAP MATRIX ANALYZER (replaces GAP_COVERAGE_MAP + GAP_NOVELTY) ──
@@ -83,6 +78,17 @@ CONFIDENCE_WEIGHTS = {
 }
 CONFIDENCE_HIGH_THRESHOLD = 4.0   # >= this → "High"
 CONFIDENCE_LOW_THRESHOLD = 2.5    # >= this → "Moderate", below → "Low"
+
+# ─── GAP TAXONOMY (Phase 2 overhaul) ─────────────────────
+TIER_CORE = "Core"           # Tracked in matrix, full Opus analysis
+TIER_SUPPORTING = "Supporting"  # Tracked in matrix, lighter Sonnet analysis
+TIER_NICHE = "Niche"         # Logged in GAP_TRACKER only, excluded from matrix
+VALID_TIERS = {TIER_CORE, TIER_SUPPORTING, TIER_NICHE}
+GAP_CLASSIFY_TIMEOUT = 300   # seconds for Opus classification call
+GAP_CLASSIFY_BATCH_SIZE = 60 # Max gaps per classification call
+
+# ─── REASONING LOG ────────────────────────────────────────
+REASONING_LOG_FILE = PIPELINE_DIR / "pipeline_data" / "reasoning_log.json"
 
 # ─── PDF PROCESSING ────────────────────────────────────────
 EXTRACTED_SUFFIX = " — Extracted.pdf"

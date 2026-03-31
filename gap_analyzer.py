@@ -3,6 +3,14 @@ PhD Literature Extraction Pipeline — Gap Analyzer
 ===================================================
 Tracks research gaps cumulatively across papers.
 Cross-validates coverage claims against actual paper content.
+
+NOTE: The categorical coverage_level system (NOT ADDRESSED → DIRECTLY TACKLED)
+in this module is LEGACY. The source of truth for gap coverage is the
+percentage-elimination model in gap_matrix_analyzer.py (GAP_MATRIX + GAP_EVIDENCE).
+This module remains in use by main.py for:
+  - Gap CREATION (merge_paper_gaps, new gap identification)
+  - Cross-validation of extraction claims
+  - State persistence in pipeline_state.json
 """
 from __future__ import annotations
 
